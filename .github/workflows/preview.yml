@@ -1,0 +1,566 @@
+# Churner per-PR preview — the reusable half.
+#
+# A customer calls this from a two-line workflow of their own (see README.md).
+# It builds the pull request's head commit on the preview stack's CodeBuild
+# project, runs it on the preview host, registers `<pr>.preview.<domain>`, and
+# reports every state change to Churner through `churner-ai/report-preview`.
+#
+# ## Everything it does, it does with the deployer role's enumerated grants
+#
+#   codebuild:StartBuild              start the image build
+#   codebuild:BatchGetBuilds          poll it to a terminal phase, and read
+#                                     the registry URI out of the build's own
+#                                     resolved environment (no ECR call)
+#   ssm:DescribeInstanceInformation   find the churner-preview-host by tag
+#   ssm:SendCommand                   run the host script on it
+#   ssm:GetCommandInvocation          read that command's result BY ID
+#
+# and nothing else — no ECR, no RDS, no Secrets Manager. A test derives both
+# sets (the calls in this file, the actions in the policy) and asserts they
+# are EQUAL, so an unused grant is as much a failure as an ungranted call.
+# The role holds no `ListCommands` / `ListCommandInvocations`: enumeration
+# turns "read my own command" into "read every command any principal ever
+# sent", which a deploy that knows its own id needs none of.
+#
+# ## Secrets never reach the runner
+#
+# The database master password and the application's secrets are read ON THE
+# HOST, by the host's own instance profile, inside the script SSM runs. The
+# runner holds exactly one credential — the Churner preview token — and it
+# crosses only as an action input, never a command line.
+#
+# This file is authored in the churner monorepo under
+# `github-actions/preview-workflow/`; `shared/tests/preview-workflow.test.ts`
+# asserts its interface, its action pins and its script checksums.
+
+name: Churner preview
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Churner project key, e.g. `MC`.
+        required: true
+        type: string
+      domain:
+        description: >-
+          Your apex domain. Previews answer at `<pr>.preview.<domain>` — the
+          zone the preview stack delegated.
+        required: true
+        type: string
+      role-arn:
+        description: >-
+          ARN of the stack's deployer role,
+          `arn:aws:iam::<account>:role/churner-preview-deployer-<projectKey>`.
+        required: true
+        type: string
+      codebuild-project:
+        description: >-
+          The stack's CodeBuild project, `churner-preview-<projectKey>`.
+        required: true
+        type: string
+      secrets-prefix:
+        description: >-
+          The Secrets Manager prefix the stack was configured with, e.g.
+          `acme/preview`. Application secrets are read from
+          `<prefix>/<NAME>` and reach the container as `<NAME>`.
+        required: true
+        type: string
+      aws-region:
+        description: Region the preview stack lives in.
+        required: true
+        type: string
+      health-path:
+        description: >-
+          Rooted path the readiness gate polls under the preview URL. `/` at
+          rest, which is right for a site and wrong for an API that answers
+          404 there.
+        required: false
+        type: string
+        default: /
+      ttl-hours:
+        description: >-
+          How long the preview is expected to live. Mirrors the module's
+          `PreviewTtlHours`; the host stamps it onto the container as
+          `churner.preview.expires_at` and the TTL reaper enforces it.
+        required: false
+        type: number
+        default: 48
+      tracker-url:
+        description: Base URL of your Churner instance. Must be https.
+        required: false
+        type: string
+        default: https://churner.ai
+      host-instance-id:
+        description: >-
+          OVERRIDE. Leave it empty: the host is found by its
+          `churner-preview-host=true` tag, and the stack creates exactly one,
+          so a hand-copied id is a value that goes stale the moment the host
+          is replaced. Set it only in an account running more than one
+          preview host, where the tag alone is ambiguous.
+        required: false
+        type: string
+        default: ''
+      scripts-base-url:
+        description: >-
+          Where the host scripts are fetched from. A PINNED TAG on the PUBLIC
+          `churner-ai/preview-stack` repository, never a branch — the host
+          runs what it fetches, as root, and fetches it with an
+          unauthenticated curl. It is the same base URL the preview stack's
+          own `PreviewScriptsBaseUrl` names, so one tag serves every artefact
+          a preview host pulls. Override it only if you vendor the scripts,
+          and re-pin their checksums with it.
+        required: false
+        type: string
+        default: https://raw.githubusercontent.com/churner-ai/preview-stack/refs/tags/v1
+    secrets:
+      preview-token:
+        description: >-
+          The project's Churner preview token, minted in the project's Access
+          settings and stored as a repository secret.
+        required: true
+
+# SHA-256 of the two host scripts, verified on the host BEFORE either is
+# executed. A test asserts both against the files' actual bytes, so a script
+# edited without re-pinning fails CI rather than failing on a customer's host.
+env:
+  CHURNER_DEPLOY_SCRIPT_SHA256: 2808333f75c1841d24add21e86622a2e5b27bcb5ad61a454a33344f55257c282
+  CHURNER_DESTROY_SCRIPT_SHA256: c8e43bcbd6a9271c4e7876d0aac621fb4ea54a10aa2143caac0abf05509b35b0
+
+jobs:
+  deploy:
+    name: Preview
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    # A build polls for 30 minutes and the readiness gate for up to 15; past
+    # 45 the job is not slow, it is stuck, and a stuck job holds a runner and
+    # leaves the record at `building` with nothing to report it.
+    timeout-minutes: 45
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      # `building` FIRST, before anything that can fail. Without it a build
+      # that dies in its first minute is indistinguishable from one that was
+      # never attempted.
+      - uses: churner-ai/report-preview@v1
+        with:
+          token: ${{ secrets.preview-token }}
+          project: ${{ inputs.project }}
+          type: building
+          pr: ${{ github.event.pull_request.number }}
+          sha: ${{ github.event.pull_request.head.sha }}
+          tracker-url: ${{ inputs.tracker-url }}
+          build-log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      # The head commit, not the merge commit: `.churner/preview/` is read
+      # from it, and the record's identity is `(project, pr, sha)`.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - uses: aws-actions/configure-aws-credentials@796449b3e38e3c256861227399e58b780e0e5538 # v6
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: churner-preview-${{ github.event.pull_request.number }}
+
+      - name: Build the image
+        id: build
+        env:
+          CODEBUILD_PROJECT: ${{ inputs.codebuild-project }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # One provisioned project serves every pull request: the commit
+          # rides as `sourceVersion`, the tag as an environment override.
+          build_id="$(
+            aws codebuild start-build \
+              --project-name "$CODEBUILD_PROJECT" \
+              --source-version "$HEAD_SHA" \
+              --environment-variables-override "name=IMAGE_TAG,value=pr-${PR_NUMBER},type=PLAINTEXT" \
+              --query 'build.id' --output text
+          )"
+          echo "Started CodeBuild ${build_id}"
+
+          json='{}'
+          status=IN_PROGRESS
+          # 120 x 15s = 30 minutes, past which a build is not slow, it is stuck.
+          for _ in $(seq 1 120); do
+            json="$(aws codebuild batch-get-builds --ids "$build_id" --output json)"
+            status="$(printf '%s' "$json" | jq -r '.builds[0].buildStatus // "IN_PROGRESS"')"
+            [ "$status" = "IN_PROGRESS" ] || break
+            sleep 15
+          done
+
+          # The console URL is assembled from the build's OWN arn, so no
+          # account-id lookup and no extra grant is needed for it.
+          arn="$(printf '%s' "$json" | jq -r '.builds[0].arn // ""')"
+          account="$(printf '%s' "$arn" | cut -d: -f5)"
+          region="$(printf '%s' "$arn" | cut -d: -f4)"
+          escaped_id="$(printf '%s' "$build_id" | sed 's/:/%3A/')"
+          log_url="https://${region}.console.aws.amazon.com/codesuite/codebuild/${account}/projects/${CODEBUILD_PROJECT}/build/${escaped_id}"
+          # Heredoc form, not `name=value`: a value containing a newline in
+          # the `name=value` form is read as further commands to the runner.
+          {
+            echo 'log-url<<CHURNER_OUTPUT_EOF'
+            echo "$log_url"
+            echo 'CHURNER_OUTPUT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$status" != "SUCCEEDED" ]; then
+            echo "::error::CodeBuild finished ${status} — ${log_url}"
+            exit 1
+          fi
+
+          # The registry URI comes out of the build's own resolved
+          # environment. Deriving it from the project key instead would mean
+          # re-implementing the module's ECR name-slug rule in shell, where a
+          # disagreement shows up as an image that cannot be pulled.
+          # Selected inside jq rather than with `| head -1`: `set -o pipefail`
+          # turns the SIGPIPE head sends into a failed step.
+          repo_uri="$(
+            printf '%s' "$json" \
+              | jq -r 'first(.builds[0].environment.environmentVariables[]? | select(.name == "ECR_REPOSITORY_URI") | .value) // ""'
+          )"
+          if [ -z "$repo_uri" ]; then
+            echo "::error::the build reported no ECR_REPOSITORY_URI — is this the preview stack's CodeBuild project?"
+            exit 1
+          fi
+          {
+            echo 'image-uri<<CHURNER_OUTPUT_EOF'
+            echo "${repo_uri}:pr-${PR_NUMBER}"
+            echo 'CHURNER_OUTPUT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run it on the preview host
+        id: deploy
+        env:
+          IMAGE_URI: ${{ steps.build.outputs.image-uri }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TTL_HOURS: ${{ inputs.ttl-hours }}
+          PREVIEW_DOMAIN: ${{ inputs.domain }}
+          SECRETS_PREFIX: ${{ inputs.secrets-prefix }}
+          HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
+          SCRIPTS_BASE_URL: ${{ inputs.scripts-base-url }}
+        run: |
+          set -euo pipefail
+
+          # Everything that will be interpolated into the SSM body is checked
+          # HERE, before the body is built and before any AWS call. All of it
+          # lands inside single quotes in a script that runs as root on a
+          # shared host, so one apostrophe is a shell escape — and a refusal
+          # is only useful if it happens before the command is sent.
+          case "$IMAGE_URI" in
+            ""|*[!A-Za-z0-9._/:-]*) echo "::error::refusing an unusable image reference"; exit 1 ;;
+          esac
+          case "$TTL_HOURS" in
+            ""|*[!0-9]*) echo "::error::ttl-hours must be a whole number of hours (got '${TTL_HOURS}')"; exit 1 ;;
+          esac
+          case "$SECRETS_PREFIX" in
+            ""|*[!A-Za-z0-9_/-]*) echo "::error::secrets-prefix must be letters, digits, '_', '-' and '/' (got '${SECRETS_PREFIX}')"; exit 1 ;;
+          esac
+          case "$SCRIPTS_BASE_URL" in
+            https://*) ;;
+            *) echo "::error::scripts-base-url must be https — the host runs what it fetches, as root"; exit 1 ;;
+          esac
+          case "$SCRIPTS_BASE_URL" in
+            *[!A-Za-z0-9._/:-]*) echo "::error::scripts-base-url contains a character a URL of this shape cannot hold"; exit 1 ;;
+          esac
+
+          # Repository conventions, both optional. See docs/customer/preview-seed.md.
+          seed_b64=''
+          if [ -f .churner/preview/seed.sql ]; then
+            seed_bytes="$(wc -c < .churner/preview/seed.sql | tr -d '[:space:]')"
+            # The seed rides inside the SSM command body, whose parameters are
+            # capped near 100 KB in total; base64 adds a third on top. Refused
+            # here, by name, rather than as an opaque AWS ValidationException.
+            if [ "$seed_bytes" -gt 60000 ]; then
+              echo "::error::.churner/preview/seed.sql is ${seed_bytes} bytes; the limit is 60000 because it travels inside one SSM command. Move the bulk into a migration your app runs at boot."
+              exit 1
+            fi
+            seed_b64="$(base64 -w0 .churner/preview/seed.sql)"
+            echo "Seeding from .churner/preview/seed.sql (${seed_bytes} bytes)"
+          fi
+
+          # REJECTED, not scrubbed. Silently deleting the offending characters
+          # turns `MY KEY` into `MYKEY` and injects a secret nobody named;
+          # a customer who typo'd a line wants to be told, not corrected.
+          secret_keys=''
+          if [ -f .churner/preview/secrets ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="${line%$'\r'}"
+              line="${line#"${line%%[![:space:]]*}"}"
+              line="${line%"${line##*[![:space:]]}"}"
+              case "$line" in
+                ''|'#'*) continue ;;
+              esac
+              case "$line" in
+                [A-Za-z_]*) ;;
+                *) echo "::error file=.churner/preview/secrets::'${line}' is not an environment-variable name (it must start with a letter or underscore)"; exit 1 ;;
+              esac
+              case "$line" in
+                *[!A-Za-z0-9_]*) echo "::error file=.churner/preview/secrets::'${line}' is not an environment-variable name (letters, digits and underscore only)"; exit 1 ;;
+              esac
+              secret_keys="${secret_keys}${line} "
+            done < .churner/preview/secrets
+            echo "Secrets to inject: ${secret_keys:-none}"
+          fi
+
+          # Fetched from a pinned tag and checksum-verified before it runs, so
+          # the host executes only bytes someone reviewed. A heredoc here
+          # instead would be a program the tests could never execute.
+          remote="$(cat <<REMOTE
+          set -euo pipefail
+          export CHURNER_PR='${PR_NUMBER}'
+          export CHURNER_SHA='${HEAD_SHA}'
+          export CHURNER_IMAGE_URI='${IMAGE_URI}'
+          export CHURNER_TTL_HOURS='${TTL_HOURS}'
+          export CHURNER_SECRETS_PREFIX='${SECRETS_PREFIX}'
+          export CHURNER_SECRET_KEYS='${secret_keys}'
+          export CHURNER_SEED_B64='${seed_b64}'
+          script="\$(mktemp)"
+          trap 'rm -f "\$script"' EXIT
+          curl -fsSL '${SCRIPTS_BASE_URL}/host/deploy-preview.sh' -o "\$script"
+          echo '${CHURNER_DEPLOY_SCRIPT_SHA256}  '"\$script" | sha256sum -c -
+          bash "\$script"
+          REMOTE
+          )"
+
+          jq -n --arg s "$remote" '{commands: [$s]}' > "${RUNNER_TEMP}/ssm.json"
+
+          # The host is found by its tag, not configured by hand: the stack
+          # creates exactly one, and an id copied into a caller's workflow
+          # goes stale the moment the host is replaced. `host-instance-id` is
+          # an override for an account that runs more than one.
+          if [ -n "$HOST_INSTANCE_ID" ]; then
+            instance_id="$HOST_INSTANCE_ID"
+          else
+            # SC2016: the backticks are JMESPath, and single quotes are
+            # exactly what stops the shell from running `Online` as a
+            # command. Double quotes here would be the bug.
+            # shellcheck disable=SC2016
+            instance_id="$(
+              aws ssm describe-instance-information \
+                --filters Key=tag:churner-preview-host,Values=true \
+                --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
+                --output text
+            )"
+          fi
+          matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
+          if [ "$matches" != "1" ]; then
+            echo "::error::expected exactly one Online instance tagged churner-preview-host=true, found ${matches}. Is the host up and registered with SSM? Pass host-instance-id to choose between several."
+            exit 1
+          fi
+          echo "Preview host: ${instance_id}"
+
+          command_id="$(
+            aws ssm send-command \
+              --document-name AWS-RunShellScript \
+              --instance-ids "$instance_id" \
+              --timeout-seconds 600 \
+              --comment "churner preview pr-${PR_NUMBER}" \
+              --parameters "file://${RUNNER_TEMP}/ssm.json" \
+              --query 'Command.CommandId' --output text
+          )"
+          echo "Sent ${command_id}"
+
+          url="https://${PR_NUMBER}.preview.${PREVIEW_DOMAIN}"
+          {
+            echo 'url<<CHURNER_OUTPUT_EOF'
+            echo "$url"
+            echo 'CHURNER_OUTPUT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          invocation='{}'
+          state=Pending
+          for _ in $(seq 1 120); do
+            invocation="$(
+              aws ssm get-command-invocation \
+                --command-id "$command_id" \
+                --instance-id "$instance_id" \
+                --output json 2>/dev/null || printf '{}'
+            )"
+            state="$(printf '%s' "$invocation" | jq -r '.Status // "Pending"')"
+            case "$state" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 5
+          done
+
+          printf '%s' "$invocation" | jq -r '.StandardOutputContent // ""'
+          printf '%s' "$invocation" | jq -r '.StandardErrorContent // ""' >&2
+          if [ "$state" != "Success" ]; then
+            echo "::error::the host reported ${state} for the deploy command"
+            exit 1
+          fi
+
+      # `ready` is a promise that the URL ANSWERS, so it is posted after this
+      # gate and never before. 60 attempts, each up to 10s of connect plus a
+      # 5s pause — so between 5 minutes (a host that refuses fast) and 15 (one
+      # that hangs). Wide enough for a cold image pull and an application boot.
+      # No `-L`: a redirect to somewhere else answering 200 is not this
+      # preview answering, and following one would report a stranger's page
+      # as ready.
+      - name: Wait for the preview to answer
+        env:
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+        run: |
+          set -euo pipefail
+          target="${PREVIEW_URL}${HEALTH_PATH}"
+          for _ in $(seq 1 60); do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$target" || printf '000')"
+            case "$code" in
+              2*|3*) echo "${target} answered ${code}"; exit 0 ;;
+            esac
+            sleep 5
+          done
+          echo "::error::${target} never answered"
+          exit 1
+
+      - uses: churner-ai/report-preview@v1
+        with:
+          token: ${{ secrets.preview-token }}
+          project: ${{ inputs.project }}
+          type: ready
+          pr: ${{ github.event.pull_request.number }}
+          sha: ${{ github.event.pull_request.head.sha }}
+          url: ${{ steps.deploy.outputs.url }}
+          health-path: ${{ inputs.health-path }}
+          expires-in: ${{ inputs.ttl-hours }}h
+          tracker-url: ${{ inputs.tracker-url }}
+          build-log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      # Without this the record sits at `building` forever, which reads as
+      # "still going" to everything downstream. The build log named is the
+      # CodeBuild one when there is a build to blame, and this run otherwise.
+      # `cancelled()` too: a cancelled run leaves the record at `building`
+      # just as surely as a failed one, and a job cancelled by the next push
+      # is the ordinary case, not the rare one.
+      - if: failure() || cancelled()
+        uses: churner-ai/report-preview@v1
+        with:
+          token: ${{ secrets.preview-token }}
+          project: ${{ inputs.project }}
+          type: failed
+          pr: ${{ github.event.pull_request.number }}
+          sha: ${{ github.event.pull_request.head.sha }}
+          error: The preview pipeline failed before the preview answered.
+          tracker-url: ${{ inputs.tracker-url }}
+          build-log-url: ${{ steps.build.outputs.log-url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+
+  # Its own job so it runs whether the pull request merged or was abandoned.
+  # The TTL reaper would get there eventually; "eventually" is up to
+  # `ttl-hours` of a database and a port held by a branch that no longer
+  # exists.
+  teardown:
+    name: Preview teardown
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@796449b3e38e3c256861227399e58b780e0e5538 # v6
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: churner-preview-teardown-${{ github.event.pull_request.number }}
+
+      - name: Tear the preview down
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
+          SCRIPTS_BASE_URL: ${{ inputs.scripts-base-url }}
+        run: |
+          set -euo pipefail
+
+          # Same checks as the deploy step, for the same reason: the value is
+          # about to be interpolated into a script that runs as root.
+          case "$SCRIPTS_BASE_URL" in
+            https://*) ;;
+            *) echo "::error::scripts-base-url must be https"; exit 1 ;;
+          esac
+          case "$SCRIPTS_BASE_URL" in
+            *[!A-Za-z0-9._/:-]*) echo "::error::scripts-base-url contains a character a URL of this shape cannot hold"; exit 1 ;;
+          esac
+
+          remote="$(cat <<REMOTE
+          set -euo pipefail
+          export CHURNER_PR='${PR_NUMBER}'
+          script="\$(mktemp)"
+          trap 'rm -f "\$script"' EXIT
+          curl -fsSL '${SCRIPTS_BASE_URL}/host/destroy-preview.sh' -o "\$script"
+          echo '${CHURNER_DESTROY_SCRIPT_SHA256}  '"\$script" | sha256sum -c -
+          bash "\$script"
+          REMOTE
+          )"
+
+          jq -n --arg s "$remote" '{commands: [$s]}' > "${RUNNER_TEMP}/ssm.json"
+
+          if [ -n "$HOST_INSTANCE_ID" ]; then
+            instance_id="$HOST_INSTANCE_ID"
+          else
+            # SC2016: the backticks are JMESPath, and single quotes are
+            # exactly what stops the shell from running `Online` as a
+            # command. Double quotes here would be the bug.
+            # shellcheck disable=SC2016
+            instance_id="$(
+              aws ssm describe-instance-information \
+                --filters Key=tag:churner-preview-host,Values=true \
+                --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
+                --output text
+            )"
+          fi
+          matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
+          if [ "$matches" != "1" ]; then
+            echo "::error::expected exactly one Online instance tagged churner-preview-host=true, found ${matches}. The preview will be reaped at its TTL instead."
+            exit 1
+          fi
+
+          command_id="$(
+            aws ssm send-command \
+              --document-name AWS-RunShellScript \
+              --instance-ids "$instance_id" \
+              --timeout-seconds 300 \
+              --comment "churner preview teardown pr-${PR_NUMBER}" \
+              --parameters "file://${RUNNER_TEMP}/ssm.json" \
+              --query 'Command.CommandId' --output text
+          )"
+          echo "Sent ${command_id}"
+
+          state=Pending
+          for _ in $(seq 1 60); do
+            invocation="$(
+              aws ssm get-command-invocation \
+                --command-id "$command_id" \
+                --instance-id "$instance_id" \
+                --output json 2>/dev/null || printf '{}'
+            )"
+            state="$(printf '%s' "$invocation" | jq -r '.Status // "Pending"')"
+            case "$state" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 5
+          done
+          echo "Teardown command finished ${state}"
+          [ "$state" = "Success" ] || echo "::warning::teardown reported ${state}; the TTL reaper is the backstop"
+
+      # `always()`, and `destroyed` is accepted from anywhere by the contract:
+      # a teardown that could not run is still a preview nobody should be
+      # sent to, and leaving the record `ready` would keep pointing at it.
+      - if: always()
+        uses: churner-ai/report-preview@v1
+        with:
+          token: ${{ secrets.preview-token }}
+          project: ${{ inputs.project }}
+          type: destroyed
+          pr: ${{ github.event.pull_request.number }}
+          sha: ${{ github.event.pull_request.head.sha }}
+          tracker-url: ${{ inputs.tracker-url }}
