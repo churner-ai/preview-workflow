@@ -21,7 +21,7 @@ jobs:
     permissions:
       id-token: write     # mint the OIDC assertion for the deployer role
       contents: read      # check out the pull request's head commit
-    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v1
+    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v2
     with:
       project: MC
       domain: example.com
@@ -59,10 +59,11 @@ stack's trust policy:
 | `secrets-prefix` | yes | — | Secrets Manager prefix the stack was configured with. |
 | `aws-region` | yes | — | Region the preview stack lives in. |
 | `health-path` | no | `/` | Rooted path the readiness gate polls. |
-| `ttl-hours` | no | `48` | Stamped onto the container as `churner.preview.expires_at`; the TTL reaper enforces it. Match the module's `PreviewTtlHours`. |
+| `ttl-hours` | no | `48` | Stamped onto the container as `churner.preview.expires_at`; the TTL reaper enforces it. Match the module's `PreviewTtlHours`. Left at `48`, the "Fetch preview settings" step (below) reads whatever the project's Previews settings card has saved and uses that instead; set this explicitly and it wins. |
+| `max-open-previews` | no | `''` | Match the module's `PreviewMaxOpenPreviews`. Unlike that value — baked into the host at first boot, so it only moves on a re-apply that replaces the host — this reaches `deploy-preview.sh` on every run, so a changed limit takes effect on the very next push. Left empty, the "Fetch preview settings" step reads whatever is saved on the Previews settings card and uses that instead; set this explicitly and it wins. An un-upgraded caller (one that predates the settings-fetch step) defers to whatever the host was bootstrapped with. |
 | `tracker-url` | no | `https://churner.ai` | Base URL of your Churner instance. https only. |
 | `host-instance-id` | no | `''` | Override. Leave it empty — the host is found by its tag. See below. |
-| `scripts-base-url` | no | `churner-ai/preview-stack` @ `refs/tags/v1` | Where the host scripts are fetched from. Override only if you vendor them. |
+| `scripts-base-url` | no | `churner-ai/preview-stack` @ `refs/tags/v2` | Where the host scripts are fetched from. Tags are immutable once published. Override only if you vendor them. |
 
 | Secret | Required | Meaning |
 |---|---|---|
@@ -140,6 +141,7 @@ the host derives both.
 | assume the deployer role | runner | `sts:AssumeRoleWithWebIdentity` (the role's trust policy) |
 | start the image build | runner | `codebuild:StartBuild` |
 | poll it, read the registry URI | runner | `codebuild:BatchGetBuilds` |
+| fetch preview settings | runner | `GET …/api/projects/:key/previews/settings`, same bearer as the events above — fail-soft: a fetch failure or an unreadable body falls back to this run's own `ttl-hours`/`max-open-previews` inputs, with a `::warning::` |
 | find the preview host by tag | runner | `ssm:DescribeInstanceInformation` |
 | run `host/deploy-preview.sh` | host | `ssm:SendCommand` |
 | read the host's log | runner | `ssm:GetCommandInvocation` |
@@ -240,9 +242,11 @@ serves them alongside everything a preview HOST fetches at boot. A copy in
 this repository too would be a second place those bytes live, one of which
 nothing verifies.
 
-So a release moves two tags, `churner-ai/preview-stack@v1` **first** and
-`churner-ai/preview-workflow@v1` after: a workflow whose pins name bytes no
-tag serves yet fails every run at `sha256sum -c`.
+So a release cuts two NEW tags, under the same tag name — `churner-ai/preview-stack@v2`
+**first** and `churner-ai/preview-workflow@v2` after: a workflow whose pins name bytes no
+tag serves yet fails every run at `sha256sum -c`. Tags on both repositories are immutable
+once published (fix round 1, M7): `@v1` keeps serving exactly what every already-applied
+stack and already-deployed workflow pin, forever.
 
 That repository is **public** on purpose — the host fetches with a plain
 unauthenticated `curl`, holding no GitHub credential of any kind, and the

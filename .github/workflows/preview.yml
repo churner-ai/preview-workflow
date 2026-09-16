@@ -82,10 +82,33 @@ on:
         description: >-
           How long the preview is expected to live. Mirrors the module's
           `PreviewTtlHours`; the host stamps it onto the container as
-          `churner.preview.expires_at` and the TTL reaper enforces it.
+          `churner.preview.expires_at` and the TTL reaper enforces it. Left
+          at the default (48), the "Fetch preview settings" step fetches
+          whatever the project's Previews settings card has saved and uses
+          THAT instead — the same live channel `max-open-previews` already
+          has. Set this explicitly and it wins over the fetched value; the
+          fetch never re-dates a preview already open.
         required: false
         type: number
         default: 48
+      max-open-previews:
+        description: >-
+          Mirrors the module's `PreviewMaxOpenPreviews` — the most previews
+          that may be open at once, empty for no limit. Unlike the module's
+          own value (baked into the host at first boot, so it moves only on
+          a re-apply that REPLACES the host under CloudFormation), this input
+          reaches `deploy-preview.sh` on every run and wins over whatever the
+          host booted with, so a changed limit takes effect on the very next
+          pull-request push, with no host replacement. Left empty, the
+          "Fetch preview settings" step fetches whatever the project's
+          Previews settings card has saved and uses THAT instead; set this
+          explicitly and it wins over the fetched value. An un-upgraded
+          caller workflow (one that predates the settings-fetch step) simply
+          gets no fetched value and defers to the host's own bootstrapped
+          value, rather than silently clearing it.
+        required: false
+        type: string
+        default: ''
       tracker-url:
         description: Base URL of your Churner instance. Must be https.
         required: false
@@ -103,16 +126,18 @@ on:
         default: ''
       scripts-base-url:
         description: >-
-          Where the host scripts are fetched from. A PINNED TAG on the PUBLIC
-          `churner-ai/preview-stack` repository, never a branch — the host
-          runs what it fetches, as root, and fetches it with an
+          Where the host scripts are fetched from. A PINNED, IMMUTABLE TAG on
+          the PUBLIC `churner-ai/preview-stack` repository, never a branch —
+          the host runs what it fetches, as root, and fetches it with an
           unauthenticated curl. It is the same base URL the preview stack's
           own `PreviewScriptsBaseUrl` names, so one tag serves every artefact
-          a preview host pulls. Override it only if you vendor the scripts,
-          and re-pin their checksums with it.
+          a preview host pulls. Tags on this repository are never re-pointed
+          once published — a script change cuts a new tag — so a pin and the
+          bytes it names can never disagree. Override it only if you vendor
+          the scripts, and re-pin their checksums with it.
         required: false
         type: string
-        default: https://raw.githubusercontent.com/churner-ai/preview-stack/refs/tags/v1
+        default: https://raw.githubusercontent.com/churner-ai/preview-stack/refs/tags/v2
     secrets:
       preview-token:
         description: >-
@@ -124,7 +149,7 @@ on:
 # executed. A test asserts both against the files' actual bytes, so a script
 # edited without re-pinning fails CI rather than failing on a customer's host.
 env:
-  CHURNER_DEPLOY_SCRIPT_SHA256: 2808333f75c1841d24add21e86622a2e5b27bcb5ad61a454a33344f55257c282
+  CHURNER_DEPLOY_SCRIPT_SHA256: 2c4b4c197239f38cee6499695df922da03bc3eeb31b488cc016e0f465d2d339d
   CHURNER_DESTROY_SCRIPT_SHA256: c8e43bcbd6a9271c4e7876d0aac621fb4ea54a10aa2143caac0abf05509b35b0
 
 jobs:
@@ -236,13 +261,100 @@ jobs:
             echo 'CHURNER_OUTPUT_EOF'
           } >> "$GITHUB_OUTPUT"
 
+      # UX review batch F, Must 1 — the durable settings channel. Reads what
+      # the settings card has SAVED (`GET …/previews/settings`, authenticated
+      # by the same preview token every other CI call uses) so a cap or TTL
+      # set there reaches an EXISTING host on the very next push, with no
+      # re-apply. Fail-SOFT: a tracker outage must never fail a preview
+      # deploy, so a failed fetch just leaves this run on the explicit
+      # workflow inputs / the host's own bootstrap defaults — exactly the
+      # behaviour before this channel existed.
+      - name: Fetch preview settings
+        id: settings
+        env:
+          TRACKER_URL: ${{ inputs.tracker-url }}
+          PROJECT: ${{ inputs.project }}
+          INPUT_TTL_HOURS: ${{ inputs.ttl-hours }}
+          INPUT_MAX_OPEN_PREVIEWS: ${{ inputs.max-open-previews }}
+          # Routed through `env:`, like every other value this workflow reads
+          # inside a `run:` body — never the raw secret expression written
+          # directly into the script text, which is both untestable (a test
+          # executing this step's body cannot substitute a YAML expression
+          # bash never sees) and inconsistent with how the rest of this file
+          # threads a value into a shell script.
+          PREVIEW_TOKEN: ${{ secrets.preview-token }}
+        run: |
+          set -uo pipefail
+
+          fetched_ttl=""
+          fetched_max_open=""
+          # The token reaches curl through a CONFIG FILE on stdin (`-K -`),
+          # never as a `-H` argv entry — an argv is visible to every other
+          # process on the runner (`ps`), a config file on a pipe is not.
+          # `--proto '=https'` (re-review round 3, code item 8): the
+          # `TRACKER_URL` input is caller-supplied, and without this curl
+          # would happily follow a scheme a caller mistyped or a redirect
+          # downgraded to, sending the bearer token in the config file over
+          # whatever protocol the URL names.
+          body="$(
+            printf 'header = "Authorization: Bearer %s"\n' "$PREVIEW_TOKEN" \
+              | curl -fsS --max-time 10 --proto '=https' -K - \
+                  "${TRACKER_URL}/api/projects/${PROJECT}/previews/settings" 2>/dev/null
+          )" || body=""
+          if [ -n "$body" ]; then
+            fetched_ttl="$(printf '%s' "$body" | jq -r '.ttlHours // empty' 2>/dev/null)" || fetched_ttl=""
+            fetched_max_open="$(printf '%s' "$body" | jq -r '.maxOpenPreviews // empty' 2>/dev/null)" || fetched_max_open=""
+          fi
+          # A non-empty body that yielded NOTHING usable from either field
+          # is treated the same as an outright fetch failure (re-review
+          # round 3, code item 7): either the response was not this route's
+          # JSON shape (jq's own parse failure is swallowed by the `|| ...`
+          # fallbacks above, so this is the only signal left), or the
+          # project genuinely has neither value set — which means the
+          # module is not opted in, and this workflow has nothing to deploy
+          # to regardless. Previously this fell through SILENTLY, with
+          # nothing logged, whenever the body was non-empty but malformed.
+          if [ -z "$fetched_ttl" ] && [ -z "$fetched_max_open" ]; then
+            echo "::warning::could not fetch preview settings from ${TRACKER_URL} — using this run's own inputs and the host's bootstrap defaults"
+          fi
+
+          # An EXPLICIT workflow input — one that differs from its schema
+          # default — wins over the fetched value: a caller's own workflow
+          # file is a deliberate override. GitHub Actions cannot tell "the
+          # caller wrote this on purpose" from "the caller never mentioned
+          # it", so the schema default is the only observable signal —
+          # `max-open-previews` already made this exact tradeoff (Task 11 /
+          # fix round 1).
+          ttl_hours="$INPUT_TTL_HOURS"
+          if [ "$ttl_hours" = "48" ] && [ -n "$fetched_ttl" ]; then
+            ttl_hours="$fetched_ttl"
+          fi
+          max_open_previews="$INPUT_MAX_OPEN_PREVIEWS"
+          if [ -z "$max_open_previews" ] && [ -n "$fetched_max_open" ]; then
+            max_open_previews="$fetched_max_open"
+          fi
+
+          # Heredoc form, not `name=value` — a value containing a newline in
+          # the `name=value` form is read as further runner commands, and
+          # both values here (fetched from the tracker) are outside this
+          # workflow's control.
+          {
+            echo 'ttl-hours<<CHURNER_OUTPUT_EOF'
+            echo "$ttl_hours"
+            echo 'CHURNER_OUTPUT_EOF'
+            echo 'max-open-previews<<CHURNER_OUTPUT_EOF'
+            echo "$max_open_previews"
+            echo 'CHURNER_OUTPUT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Run it on the preview host
         id: deploy
         env:
           IMAGE_URI: ${{ steps.build.outputs.image-uri }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          TTL_HOURS: ${{ inputs.ttl-hours }}
+          TTL_HOURS: ${{ steps.settings.outputs.ttl-hours }}
+          MAX_OPEN_PREVIEWS: ${{ steps.settings.outputs.max-open-previews }}
           PREVIEW_DOMAIN: ${{ inputs.domain }}
           SECRETS_PREFIX: ${{ inputs.secrets-prefix }}
           HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
@@ -260,6 +372,14 @@ jobs:
           esac
           case "$TTL_HOURS" in
             ""|*[!0-9]*) echo "::error::ttl-hours must be a whole number of hours (got '${TTL_HOURS}')"; exit 1 ;;
+          esac
+          # Empty is legal here — it means "this call states no cap", which
+          # defers to the host's own bootstrapped value (see deploy-preview.sh)
+          # rather than the workflow input schema's default silently clearing
+          # a cap configured on the module.
+          case "$MAX_OPEN_PREVIEWS" in
+            '') ;;
+            *[!0-9]*) echo "::error::max-open-previews must be a whole number of open previews, or empty for no limit (got '${MAX_OPEN_PREVIEWS}')"; exit 1 ;;
           esac
           case "$SECRETS_PREFIX" in
             ""|*[!A-Za-z0-9_/-]*) echo "::error::secrets-prefix must be letters, digits, '_', '-' and '/' (got '${SECRETS_PREFIX}')"; exit 1 ;;
@@ -320,6 +440,7 @@ jobs:
           export CHURNER_SHA='${HEAD_SHA}'
           export CHURNER_IMAGE_URI='${IMAGE_URI}'
           export CHURNER_TTL_HOURS='${TTL_HOURS}'
+          export CHURNER_MAX_OPEN_PREVIEWS='${MAX_OPEN_PREVIEWS}'
           export CHURNER_SECRETS_PREFIX='${SECRETS_PREFIX}'
           export CHURNER_SECRET_KEYS='${secret_keys}'
           export CHURNER_SEED_B64='${seed_b64}'
@@ -392,9 +513,20 @@ jobs:
             sleep 5
           done
 
+          err="$(printf '%s' "$invocation" | jq -r '.StandardErrorContent // ""')"
           printf '%s' "$invocation" | jq -r '.StandardOutputContent // ""'
-          printf '%s' "$invocation" | jq -r '.StandardErrorContent // ""' >&2
+          printf '%s' "$err" >&2
           if [ "$state" != "Success" ]; then
+            # The host's OWN reason when it refused deliberately, so the record
+            # in Churner says "the cap was reached" instead of the catch-all.
+            reason="$(printf '%s' "$err" | grep -m1 'churner-preview-cap-reached:' || true)"
+            if [ -n "$reason" ]; then
+              {
+                echo 'failure-reason<<CHURNER_OUTPUT_EOF'
+                echo "${reason#*churner-preview-cap-reached: }"
+                echo 'CHURNER_OUTPUT_EOF'
+              } >> "$GITHUB_OUTPUT"
+            fi
             echo "::error::the host reported ${state} for the deploy command"
             exit 1
           fi
@@ -432,7 +564,7 @@ jobs:
           sha: ${{ github.event.pull_request.head.sha }}
           url: ${{ steps.deploy.outputs.url }}
           health-path: ${{ inputs.health-path }}
-          expires-in: ${{ inputs.ttl-hours }}h
+          expires-in: ${{ steps.settings.outputs.ttl-hours }}h
           tracker-url: ${{ inputs.tracker-url }}
           build-log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -450,7 +582,7 @@ jobs:
           type: failed
           pr: ${{ github.event.pull_request.number }}
           sha: ${{ github.event.pull_request.head.sha }}
-          error: The preview pipeline failed before the preview answered.
+          error: ${{ steps.deploy.outputs.failure-reason || 'The preview pipeline failed before the preview answered.' }}
           tracker-url: ${{ inputs.tracker-url }}
           build-log-url: ${{ steps.build.outputs.log-url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
 
