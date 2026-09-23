@@ -1,7 +1,7 @@
 # `churner-ai/preview-workflow`
 
 The reusable GitHub Actions workflow that drives a per-PR preview on the
-[Churner preview stack](../../infrastructure/customer/preview-stack/README.md).
+[Churner preview stack](https://github.com/churner-ai/preview-stack/blob/v2/README.md).
 
 Apply the stack once; then every pull request builds, deploys, reports itself
 to Churner, and tears itself down — through the deployer role the stack
@@ -21,7 +21,7 @@ jobs:
     permissions:
       id-token: write     # mint the OIDC assertion for the deployer role
       contents: read      # check out the pull request's head commit
-    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v2
+    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v3
     with:
       project: MC
       domain: example.com
@@ -101,7 +101,7 @@ push to the same pull request re-runs everything else but leaves the database
 alone — re-seeding would wipe whatever a reviewer typed into the preview
 between the two pushes, which looks from outside exactly like the application
 losing data. Capped at 60 000 bytes, because it travels inside one SSM
-command. Full convention: [`docs/customer/preview-seed.md`](../../docs/customer/preview-seed.md).
+command. Full convention: [`docs/customer/preview-seed.md`](https://churner.ai/docs/preview-seed).
 
 ### `.churner/preview/secrets`
 
@@ -132,6 +132,28 @@ Three outcomes once a name is accepted:
 
 `PORT` and `DATABASE_URL` are skipped with a warning if named here, because
 the host derives both.
+
+A line written `NAME:generate` names a secret the application owns (a signing
+key, an encryption key, an internal token). When `<secrets-prefix>/NAME` does
+not exist — and ONLY on a `ResourceNotFoundException`; a denied or throttled
+read fails the deploy instead — the host creates it with 48 random bytes,
+base64url, passed to `create-secret` as `file://` from a 0600 temp file and
+tagged `churner-generated=true`, then reads it back like any other name. An
+existing secret is never overwritten. The token travels through
+`CHURNER_SECRET_KEYS` as written; the container receives `NAME`. Any other
+`:suffix` fails the job. The create is allowed by the host role's
+`SecretsManagerCreateGeneratedPreviewSecrets` statement, which a stack applied
+before it existed lacks: the deploy then fails naming the fix — apply the
+current template from Churner's Access page, or create the secret yourself.
+
+**Rollout order for an existing repository.** (1) Apply the stack update the
+Access page offers — it adds only the create grant. (2) Move the repository's
+callers onto a workflow version that understands the form (this workflow at
+`@v3` for previews, the release workflow at `@v1.3`) by re-scaffolding them —
+"Update the release workflows" on the project's Build tab. (3) Only then add
+`NAME:generate` lines: a caller on an older version rejects the form and fails
+every deploy, which is why Churner's agent writes the line only after checking
+the pin.
 
 ## What runs where
 

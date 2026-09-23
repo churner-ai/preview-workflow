@@ -82,12 +82,15 @@ on:
         description: >-
           How long the preview is expected to live. Mirrors the module's
           `PreviewTtlHours`; the host stamps it onto the container as
-          `churner.preview.expires_at` and the TTL reaper enforces it. Left
-          at the default (48), the "Fetch preview settings" step fetches
-          whatever the project's Previews settings card has saved and uses
-          THAT instead — the same live channel `max-open-previews` already
-          has. Set this explicitly and it wins over the fetched value; the
-          fetch never re-dates a preview already open.
+          `churner.preview.expires_at` and the TTL reaper enforces it. At the
+          value 48, the "Fetch preview settings" step fetches whatever the
+          project's Previews settings card has saved and uses THAT instead —
+          the same live channel `max-open-previews` already has. Set this to
+          anything OTHER than 48 and it wins over the fetched value; to pin
+          48 itself, set it on the Previews settings card, because GitHub
+          Actions cannot tell a caller that wrote 48 on purpose from one that
+          never mentioned the input. The fetch never re-dates a preview
+          already open.
         required: false
         type: number
         default: 48
@@ -129,15 +132,16 @@ on:
           Where the host scripts are fetched from. A PINNED, IMMUTABLE TAG on
           the PUBLIC `churner-ai/preview-stack` repository, never a branch —
           the host runs what it fetches, as root, and fetches it with an
-          unauthenticated curl. It is the same base URL the preview stack's
-          own `PreviewScriptsBaseUrl` names, so one tag serves every artefact
-          a preview host pulls. Tags on this repository are never re-pointed
+          unauthenticated curl. It is the same repository the preview stack's
+          own `PreviewScriptsBaseUrl` names, possibly a LATER tag of it (one
+          that changed only these scripts, so hosts need not be replaced).
+          Tags on this repository are never re-pointed
           once published — a script change cuts a new tag — so a pin and the
           bytes it names can never disagree. Override it only if you vendor
           the scripts, and re-pin their checksums with it.
         required: false
         type: string
-        default: https://raw.githubusercontent.com/churner-ai/preview-stack/refs/tags/v2
+        default: https://raw.githubusercontent.com/churner-ai/preview-stack/refs/tags/v3
     secrets:
       preview-token:
         description: >-
@@ -149,7 +153,7 @@ on:
 # executed. A test asserts both against the files' actual bytes, so a script
 # edited without re-pinning fails CI rather than failing on a customer's host.
 env:
-  CHURNER_DEPLOY_SCRIPT_SHA256: 2c4b4c197239f38cee6499695df922da03bc3eeb31b488cc016e0f465d2d339d
+  CHURNER_DEPLOY_SCRIPT_SHA256: c80848306ef80059e7719f275431fd90a801f10d15f88ad2bc997e21facc3903
   CHURNER_DESTROY_SCRIPT_SHA256: c8e43bcbd6a9271c4e7876d0aac621fb4ea54a10aa2143caac0abf05509b35b0
 
 jobs:
@@ -419,11 +423,19 @@ jobs:
               case "$line" in
                 ''|'#'*) continue ;;
               esac
+              # `NAME` (the secret must exist) or `NAME:generate` (a secret
+              # the app owns; the host creates it when absent). The token
+              # travels as written; the host strips the suffix.
               case "$line" in
+                *:generate) name="${line%:generate}" ;;
+                *:*) echo "::error file=.churner/preview/secrets::'${line}' has an unknown suffix (the only one understood is ':generate')"; exit 1 ;;
+                *) name="$line" ;;
+              esac
+              case "$name" in
                 [A-Za-z_]*) ;;
                 *) echo "::error file=.churner/preview/secrets::'${line}' is not an environment-variable name (it must start with a letter or underscore)"; exit 1 ;;
               esac
-              case "$line" in
+              case "$name" in
                 *[!A-Za-z0-9_]*) echo "::error file=.churner/preview/secrets::'${line}' is not an environment-variable name (letters, digits and underscore only)"; exit 1 ;;
               esac
               secret_keys="${secret_keys}${line} "
