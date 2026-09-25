@@ -1,12 +1,17 @@
 # Churner per-PR preview — the reusable half.
 #
 # A customer calls this from a two-line workflow of their own (see README.md).
-# It builds the pull request's head commit on the preview stack's CodeBuild
-# project, runs it on the preview host, registers `<pr>.preview.<domain>`, and
-# reports every state change to Churner through `churner-ai/report-preview`.
+# It uploads the pull request's head commit (a `git archive` of the checkout,
+# no history) to the preview stack's build-context bucket, builds it on the
+# stack's CodeBuild project, runs it on the preview host, registers
+# `<pr>.<preview-zone>`, and reports every state change to Churner through
+# `churner-ai/report-preview`. The build never fetches from GitHub, so a
+# private repository needs no CodeBuild source credential.
 #
 # ## Everything it does, it does with the deployer role's enumerated grants
 #
+#   s3:PutObject                      upload the source tarball, under
+#                                     `build-contexts/` of the stack's bucket
 #   codebuild:StartBuild              start the image build
 #   codebuild:BatchGetBuilds          poll it to a terminal phase, and read
 #                                     the registry URI out of the build's own
@@ -42,10 +47,19 @@ on:
         description: Churner project key, e.g. `MC`.
         required: true
         type: string
-      domain:
+      preview-zone:
         description: >-
-          Your apex domain. Previews answer at `<pr>.preview.<domain>` — the
-          zone the preview stack delegated.
+          The zone the preview stack created — its `PreviewBaseDomain`
+          output. Previews answer at `<pr>.<preview-zone>`:
+          `preview.<your domain>` on a domain of your own,
+          `<key>.churner.dev` itself on the Churner domain.
+        required: true
+        type: string
+      build-context-bucket:
+        description: >-
+          The stack's build-context bucket — its `PreviewBuildContextBucket`
+          output, `churner-preview-<projectKey>-src-<account>`. The pull
+          request's source is uploaded here and CodeBuild builds from it.
         required: true
         type: string
       role-arn:
@@ -199,18 +213,71 @@ jobs:
         id: build
         env:
           CODEBUILD_PROJECT: ${{ inputs.codebuild-project }}
+          BUILD_CONTEXT_BUCKET: ${{ inputs.build-context-bucket }}
+          REPOSITORY: ${{ github.event.repository.name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
 
-          # One provisioned project serves every pull request: the commit
-          # rides as `sourceVersion`, the tag as an environment override.
+          # Checked before anything is uploaded: each lands in an S3 key or
+          # a CodeBuild argument, and a refusal is only useful up front.
+          case "$BUILD_CONTEXT_BUCKET" in
+            ""|*[!a-z0-9.-]*) echo "::error::build-context-bucket must be an S3 bucket name (got '${BUILD_CONTEXT_BUCKET}')"; exit 1 ;;
+          esac
+          case "$REPOSITORY" in
+            ""|*[!A-Za-z0-9._-]*) echo "::error::refusing an unusable repository name"; exit 1 ;;
+          esac
+          case "$HEAD_SHA" in
+            ""|*[!0-9a-f]*) echo "::error::refusing an unusable head sha"; exit 1 ;;
+          esac
+          case "$PR_NUMBER" in
+            ""|*[!0-9]*) echo "::error::refusing an unusable pull-request number"; exit 1 ;;
+          esac
+
+          # The source comes from THIS checkout — the exact head commit, as a
+          # tarball with no history — never from a clone CodeBuild makes. So
+          # the build needs no GitHub credential of any kind, and a private
+          # repository needs no CodeBuild source credential.
+          archive="${HEAD_SHA}.tar.gz"
+          key="build-contexts/${REPOSITORY}/${PR_NUMBER}/${archive}"
+          git archive --format=tar.gz -o "${RUNNER_TEMP}/${archive}" "$HEAD_SHA"
+          # A stack applied before the bucket existed answers NoSuchBucket (or
+          # AccessDenied — the role predates the grant too). Churner does not
+          # move a repository onto this version until the stack reports the
+          # bucket, so this is the one-line reason if it happens anyway.
+          if ! upload_err="$(
+            aws s3api put-object \
+              --bucket "$BUILD_CONTEXT_BUCKET" \
+              --key "$key" \
+              --body "${RUNNER_TEMP}/${archive}" \
+              --output text 2>&1 >/dev/null
+          )"; then
+            case "$upload_err" in
+              *NoSuchBucket*|*AccessDenied*)
+                echo "::error::The build-context bucket ${BUILD_CONTEXT_BUCKET} doesn't exist yet, or this workflow's role can't write to it — apply the stack update from Churner's Infrastructure page."
+                ;;
+              *)
+                echo "::error::Uploading the build context to ${BUILD_CONTEXT_BUCKET} failed: ${upload_err}"
+                ;;
+            esac
+            exit 1
+          fi
+          echo "Uploaded s3://${BUILD_CONTEXT_BUCKET}/${key}"
+
+          # One provisioned project serves every pull request. Its own source
+          # is S3, at the bucket's `build-contexts/` prefix, so only the
+          # LOCATION is overridden (the type never changes, which is what
+          # keeps the project's inline buildspec); the tag rides as an
+          # environment override, and `SOURCE_ARCHIVE` tells the buildspec
+          # which file to unpack — CodeBuild extracts only a zip itself.
           build_id="$(
             aws codebuild start-build \
               --project-name "$CODEBUILD_PROJECT" \
-              --source-version "$HEAD_SHA" \
-              --environment-variables-override "name=IMAGE_TAG,value=pr-${PR_NUMBER},type=PLAINTEXT" \
+              --source-location-override "${BUILD_CONTEXT_BUCKET}/${key}" \
+              --environment-variables-override \
+                "name=IMAGE_TAG,value=pr-${PR_NUMBER},type=PLAINTEXT" \
+                "name=SOURCE_ARCHIVE,value=${archive},type=PLAINTEXT" \
               --query 'build.id' --output text
           )"
           echo "Started CodeBuild ${build_id}"
@@ -359,7 +426,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           TTL_HOURS: ${{ steps.settings.outputs.ttl-hours }}
           MAX_OPEN_PREVIEWS: ${{ steps.settings.outputs.max-open-previews }}
-          PREVIEW_DOMAIN: ${{ inputs.domain }}
+          PREVIEW_ZONE: ${{ inputs.preview-zone }}
           SECRETS_PREFIX: ${{ inputs.secrets-prefix }}
           HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
           SCRIPTS_BASE_URL: ${{ inputs.scripts-base-url }}
@@ -387,6 +454,9 @@ jobs:
           esac
           case "$SECRETS_PREFIX" in
             ""|*[!A-Za-z0-9_/-]*) echo "::error::secrets-prefix must be letters, digits, '_', '-' and '/' (got '${SECRETS_PREFIX}')"; exit 1 ;;
+          esac
+          case "$PREVIEW_ZONE" in
+            ""|*[!a-z0-9.-]*) echo "::error::preview-zone must be a lower-case DNS name (got '${PREVIEW_ZONE}')"; exit 1 ;;
           esac
           case "$SCRIPTS_BASE_URL" in
             https://*) ;;
@@ -502,7 +572,7 @@ jobs:
           )"
           echo "Sent ${command_id}"
 
-          url="https://${PR_NUMBER}.preview.${PREVIEW_DOMAIN}"
+          url="https://${PR_NUMBER}.${PREVIEW_ZONE}"
           {
             echo 'url<<CHURNER_OUTPUT_EOF'
             echo "$url"

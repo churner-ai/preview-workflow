@@ -21,12 +21,13 @@ jobs:
     permissions:
       id-token: write     # mint the OIDC assertion for the deployer role
       contents: read      # check out the pull request's head commit
-    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v3
+    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v4
     with:
       project: MC
-      domain: example.com
+      preview-zone: preview.example.com
       role-arn: arn:aws:iam::111122223333:role/churner-preview-deployer-mc
       codebuild-project: churner-preview-mc
+      build-context-bucket: churner-preview-mc-src-111122223333
       secrets-prefix: acme/preview
       aws-region: us-east-2
       health-path: /api/health
@@ -53,9 +54,10 @@ stack's trust policy:
 | Input | Required | Default | Meaning |
 |---|---|---|---|
 | `project` | yes | — | Churner project key, e.g. `MC`. |
-| `domain` | yes | — | Your apex domain. Previews answer at `<pr>.preview.<domain>`. |
+| `preview-zone` | yes | — | The stack's `PreviewBaseDomain` output. Previews answer at `<pr>.<preview-zone>` — `preview.<your domain>` on your own domain, `<key>.churner.dev` itself on the Churner domain. Replaces v3's `domain`. |
 | `role-arn` | yes | — | The stack's `churner-preview-deployer-<projectKey>` role. |
 | `codebuild-project` | yes | — | The stack's CodeBuild project, `churner-preview-<projectKey>`. |
+| `build-context-bucket` | yes | — | The stack's `PreviewBuildContextBucket` output, `churner-preview-<projectKey>-src-<account>`. The pull request's source is uploaded here and built from it. New in v4. |
 | `secrets-prefix` | yes | — | Secrets Manager prefix the stack was configured with. |
 | `aws-region` | yes | — | Region the preview stack lives in. |
 | `health-path` | no | `/` | Rooted path the readiness gate polls. |
@@ -63,7 +65,7 @@ stack's trust policy:
 | `max-open-previews` | no | `''` | Match the module's `PreviewMaxOpenPreviews`. Unlike that value — baked into the host at first boot, so it only moves on a re-apply that replaces the host — this reaches `deploy-preview.sh` on every run, so a changed limit takes effect on the very next push. Left empty, the "Fetch preview settings" step reads whatever is saved on the Previews settings card and uses that instead; set this explicitly and it wins. An un-upgraded caller (one that predates the settings-fetch step) defers to whatever the host was bootstrapped with. |
 | `tracker-url` | no | `https://churner.ai` | Base URL of your Churner instance. https only. |
 | `host-instance-id` | no | `''` | Override. Leave it empty — the host is found by its tag. See below. |
-| `scripts-base-url` | no | `churner-ai/preview-stack` @ `refs/tags/v2` | Where the host scripts are fetched from. Tags are immutable once published. Override only if you vendor them. |
+| `scripts-base-url` | no | `churner-ai/preview-stack` @ `refs/tags/v3` | Where the host scripts are fetched from. Tags are immutable once published. Override only if you vendor them. |
 
 | Secret | Required | Meaning |
 |---|---|---|
@@ -149,11 +151,27 @@ current template from Churner's Access page, or create the secret yourself.
 **Rollout order for an existing repository.** (1) Apply the stack update the
 Access page offers — it adds only the create grant. (2) Move the repository's
 callers onto a workflow version that understands the form (this workflow at
-`@v3` for previews, the release workflow at `@v1.3`) by re-scaffolding them —
-"Update the release workflows" on the project's Build tab. (3) Only then add
+`@v3` or later for previews, the release workflow at `@v1.3`) — Churner opens its
+"Update Churner workflows" pull request for that by itself, and the project's
+Build tab shows where it is. (3) Only then add
 `NAME:generate` lines: a caller on an older version rejects the form and fails
 every deploy, which is why Churner's agent writes the line only after checking
 the pin.
+
+## The build never fetches from GitHub
+
+From v4 the pull request's source travels from the runner's own checkout:
+the workflow `git archive`s the exact head commit, uploads it to the stack's
+build-context bucket, and starts CodeBuild with `--source-location-override`
+naming that object — the project's own source is S3, at the bucket's
+`build-contexts/` prefix, so only the location changes per build. The build
+holds no GitHub credential and needs none, so a private repository needs no
+CodeBuild source credential. The bucket keeps each upload for 7 days.
+
+It needs a stack applied since the bucket existed. Churner moves a
+repository onto `@v4` only once the stack reports the bucket; an upload that
+finds none fails with one line saying to apply the stack update from
+Churner's Infrastructure page.
 
 ## What runs where
 
@@ -161,7 +179,8 @@ the pin.
 |---|---|---|
 | `building` event | runner | — |
 | assume the deployer role | runner | `sts:AssumeRoleWithWebIdentity` (the role's trust policy) |
-| start the image build | runner | `codebuild:StartBuild` |
+| upload the head commit (`git archive`, no history) to `build-contexts/<repo>/<pr>/<sha>.tar.gz` | runner | `s3:PutObject` |
+| start the image build from that upload | runner | `codebuild:StartBuild` (source overridden to the upload) |
 | poll it, read the registry URI | runner | `codebuild:BatchGetBuilds` |
 | fetch preview settings | runner | `GET …/api/projects/:key/previews/settings`, same bearer as the events above — fail-soft: a fetch failure or an unreadable body falls back to this run's own `ttl-hours`/`max-open-previews` inputs, with a `::warning::` |
 | find the preview host by tag | runner | `ssm:DescribeInstanceInformation` |
