@@ -8,6 +8,9 @@
 # `churner-ai/report-preview`. The build never fetches from GitHub, so a
 # private repository needs no CodeBuild source credential.
 #
+# A commit with no `Dockerfile` at its root has no app to preview yet: the job
+# builds nothing, reports nothing, says so in its summary, and passes.
+#
 # ## Everything it does, it does with the deployer role's enumerated grants
 #
 #   s3:PutObject                      upload the source tarball, under
@@ -183,10 +186,171 @@ jobs:
       id-token: write
       contents: read
     steps:
-      # `building` FIRST, before anything that can fail. Without it a build
-      # that dies in its first minute is indistinguishable from one that was
-      # never attempted.
-      - uses: churner-ai/report-preview@v1
+      # The head commit, not the merge commit: `.churner/preview/` is read
+      # from it, and the record's identity is `(project, pr, sha)`.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      # The image is built with `docker build .` at the root of the uploaded
+      # commit. A repository with no root Dockerfile has no app to preview
+      # yet — a fresh project whose first app change has not merged — and
+      # building it can only fail. So nothing is built and nothing new is
+      # reported: no record means no preview, which is the truth, whereas a
+      # `failed` would say a preview broke and a failing required check would
+      # block every pull request (Churner's own workflow update included)
+      # until an app exists. Every later step is gated on `present`. The one
+      # thing a no-Dockerfile run DOES do is retire a preview an EARLIER
+      # commit of this pull request left running (below).
+      - name: Look for a Dockerfile
+        id: app
+        run: |
+          set -euo pipefail
+          if [ -f Dockerfile ]; then
+            echo 'present=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'present=false' >> "$GITHUB_OUTPUT"
+          # SC2016: the backticks are Markdown for the summary, not a command.
+          # shellcheck disable=SC2016
+          message='Nothing to preview yet — previews build from a file named `Dockerfile` at the repository root, and this commit has none. Previews start once the app has one.'
+          echo "::notice title=No preview::${message}"
+          printf '### Nothing to preview yet\n\n%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+
+      # A pull request whose latest commit deleted the Dockerfile may still
+      # have a preview from an earlier commit — a container serving code the
+      # branch no longer has, and a record saying `ready`. Tear it down with
+      # the same checksum-verified script the close teardown runs, and report
+      # `destroyed` ONLY when there was a container to remove; a pull request
+      # that never had a preview posts nothing. Entirely fail-soft: a
+      # repository with no app yet must never get a red check from here, and
+      # the TTL reaper is the backstop for anything this could not reach.
+      - if: steps.app.outputs.present == 'false'
+        id: credentials-retire
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@796449b3e38e3c256861227399e58b780e0e5538 # v6
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: churner-preview-retire-${{ github.event.pull_request.number }}
+
+      - name: Retire an earlier preview of this pull request
+        id: retire
+        if: steps.app.outputs.present == 'false' && steps.credentials-retire.outcome == 'success'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
+          SCRIPTS_BASE_URL: ${{ inputs.scripts-base-url }}
+        run: |
+          set -uo pipefail
+
+          skip() { echo "::warning::could not check for an earlier preview of this pull request ($1); the TTL reaper removes any left behind"; exit 0; }
+
+          case "$PR_NUMBER" in
+            ""|*[!0-9]*) skip "unusable pull-request number" ;;
+          esac
+          case "$SCRIPTS_BASE_URL" in
+            https://*) ;;
+            *) skip "scripts-base-url must be https" ;;
+          esac
+          case "$SCRIPTS_BASE_URL" in
+            *[!A-Za-z0-9._/:-]*) skip "scripts-base-url contains a character a URL of this shape cannot hold" ;;
+          esac
+
+          # The container name is the host's own (`destroy-preview.sh`), so
+          # "this pull request has a preview" is asked of the host, not
+          # guessed. Nothing is torn down unless it exists.
+          remote="$(cat <<REMOTE
+          set -euo pipefail
+          if ! docker inspect 'churner-preview-pr-${PR_NUMBER}' >/dev/null 2>&1; then
+            echo 'churner-preview-none'
+            exit 0
+          fi
+          export CHURNER_PR='${PR_NUMBER}'
+          script="\$(mktemp)"
+          trap 'rm -f "\$script"' EXIT
+          curl -fsSL '${SCRIPTS_BASE_URL}/host/destroy-preview.sh' -o "\$script"
+          echo '${CHURNER_DESTROY_SCRIPT_SHA256}  '"\$script" | sha256sum -c -
+          bash "\$script"
+          echo 'churner-preview-torn-down'
+          REMOTE
+          )"
+
+          jq -n --arg s "$remote" '{commands: [$s]}' > "${RUNNER_TEMP}/ssm.json" || skip "could not build the command"
+
+          if [ -n "$HOST_INSTANCE_ID" ]; then
+            instance_id="$HOST_INSTANCE_ID"
+          else
+            # SC2016: the backticks are JMESPath, and single quotes are
+            # exactly what stops the shell from running `Online` as a
+            # command. Double quotes here would be the bug.
+            # shellcheck disable=SC2016
+            instance_id="$(
+              aws ssm describe-instance-information \
+                --filters Key=tag:churner-preview-host,Values=true \
+                --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
+                --output text
+            )" || skip "the preview host could not be looked up"
+          fi
+          matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
+          [ "$matches" = "1" ] || skip "expected exactly one Online preview host, found ${matches}"
+
+          command_id="$(
+            aws ssm send-command \
+              --document-name AWS-RunShellScript \
+              --instance-ids "$instance_id" \
+              --timeout-seconds 300 \
+              --comment "churner preview retire pr-${PR_NUMBER}" \
+              --parameters "file://${RUNNER_TEMP}/ssm.json" \
+              --query 'Command.CommandId' --output text
+          )" || skip "the command could not be sent"
+
+          invocation='{}'
+          state=Pending
+          for _ in $(seq 1 60); do
+            invocation="$(
+              aws ssm get-command-invocation \
+                --command-id "$command_id" \
+                --instance-id "$instance_id" \
+                --output json 2>/dev/null || printf '{}'
+            )"
+            state="$(printf '%s' "$invocation" | jq -r '.Status // "Pending"')"
+            case "$state" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 5
+          done
+          [ "$state" = "Success" ] || skip "the host reported ${state}"
+
+          out="$(printf '%s' "$invocation" | jq -r '.StandardOutputContent // ""')"
+          printf '%s\n' "$out"
+          case "$out" in
+            *churner-preview-torn-down*)
+              echo "Removed the preview an earlier commit of pull request #${PR_NUMBER} left running."
+              echo 'torn-down=true' >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Pull request #${PR_NUMBER} has no preview to remove."
+              ;;
+          esac
+
+      - if: steps.retire.outputs.torn-down == 'true'
+        continue-on-error: true
+        uses: churner-ai/report-preview@v1
+        with:
+          token: ${{ secrets.preview-token }}
+          project: ${{ inputs.project }}
+          type: destroyed
+          pr: ${{ github.event.pull_request.number }}
+          sha: ${{ github.event.pull_request.head.sha }}
+          tracker-url: ${{ inputs.tracker-url }}
+
+      # `building` next, before anything that can fail once there is an app
+      # to build. Without it a build that dies in its first minute is
+      # indistinguishable from one that was never attempted.
+      - if: steps.app.outputs.present == 'true'
+        uses: churner-ai/report-preview@v1
         with:
           token: ${{ secrets.preview-token }}
           project: ${{ inputs.project }}
@@ -196,14 +360,8 @@ jobs:
           tracker-url: ${{ inputs.tracker-url }}
           build-log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-      # The head commit, not the merge commit: `.churner/preview/` is read
-      # from it, and the record's identity is `(project, pr, sha)`.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
-
-      - uses: aws-actions/configure-aws-credentials@796449b3e38e3c256861227399e58b780e0e5538 # v6
+      - if: steps.app.outputs.present == 'true'
+        uses: aws-actions/configure-aws-credentials@796449b3e38e3c256861227399e58b780e0e5538 # v6
         with:
           role-to-assume: ${{ inputs.role-arn }}
           aws-region: ${{ inputs.aws-region }}
@@ -211,6 +369,7 @@ jobs:
 
       - name: Build the image
         id: build
+        if: steps.app.outputs.present == 'true'
         env:
           CODEBUILD_PROJECT: ${{ inputs.codebuild-project }}
           BUILD_CONTEXT_BUCKET: ${{ inputs.build-context-bucket }}
@@ -342,6 +501,7 @@ jobs:
       # behaviour before this channel existed.
       - name: Fetch preview settings
         id: settings
+        if: steps.app.outputs.present == 'true'
         env:
           TRACKER_URL: ${{ inputs.tracker-url }}
           PROJECT: ${{ inputs.project }}
@@ -420,6 +580,7 @@ jobs:
 
       - name: Run it on the preview host
         id: deploy
+        if: steps.app.outputs.present == 'true'
         env:
           IMAGE_URI: ${{ steps.build.outputs.image-uri }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -621,6 +782,7 @@ jobs:
       # preview answering, and following one would report a stranger's page
       # as ready.
       - name: Wait for the preview to answer
+        if: steps.app.outputs.present == 'true'
         env:
           PREVIEW_URL: ${{ steps.deploy.outputs.url }}
           HEALTH_PATH: ${{ inputs.health-path }}
@@ -637,7 +799,8 @@ jobs:
           echo "::error::${target} never answered"
           exit 1
 
-      - uses: churner-ai/report-preview@v1
+      - if: steps.app.outputs.present == 'true'
+        uses: churner-ai/report-preview@v1
         with:
           token: ${{ secrets.preview-token }}
           project: ${{ inputs.project }}
@@ -655,8 +818,9 @@ jobs:
       # CodeBuild one when there is a build to blame, and this run otherwise.
       # `cancelled()` too: a cancelled run leaves the record at `building`
       # just as surely as a failed one, and a job cancelled by the next push
-      # is the ordinary case, not the rare one.
-      - if: failure() || cancelled()
+      # is the ordinary case, not the rare one. Never for a commit with no
+      # Dockerfile: nothing was attempted there, so nothing failed.
+      - if: (failure() || cancelled()) && steps.app.outputs.present != 'false'
         uses: churner-ai/report-preview@v1
         with:
           token: ${{ secrets.preview-token }}

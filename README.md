@@ -21,7 +21,7 @@ jobs:
     permissions:
       id-token: write     # mint the OIDC assertion for the deployer role
       contents: read      # check out the pull request's head commit
-    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v4
+    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v5
     with:
       project: MC
       preview-zone: preview.example.com
@@ -203,6 +203,16 @@ enters docker's argv where `ps` would show it to every other process on the
 host.
 
 ## What your image has to do
+
+**Have a `Dockerfile` at the repository root** — the build is `docker build .`
+on the uploaded commit. A commit without one has no app to preview yet: the
+job (from `v5`) builds nothing, writes "Nothing to preview yet" to its
+summary, and passes, so a required check is not red on a repository whose
+first app change has not landed. It reports nothing to Churner — unless an
+earlier commit of the same pull request left a preview running, which it tears
+down with `destroy-preview.sh` and reports `destroyed`. That clean-up is
+fail-soft: when the account or host cannot be reached it warns and the TTL
+reaper removes the preview.
 
 **Listen on `$PORT`.** The host derives one port per pull request
 (`30000 + pr % 20000`), publishes it as `127.0.0.1:<port>:<port>`, passes it
