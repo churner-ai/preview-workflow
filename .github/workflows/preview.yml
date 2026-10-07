@@ -1,45 +1,49 @@
 # Churner per-PR preview — the reusable half.
 #
-# A customer calls this from a two-line workflow of their own (see README.md).
+# A customer calls this from a short workflow of their own (see README.md).
 # It uploads the pull request's head commit (a `git archive` of the checkout,
 # no history) to the preview stack's build-context bucket, builds it on the
-# stack's CodeBuild project, runs it on the preview host, registers
-# `<pr>.<preview-zone>`, and reports every state change to Churner through
-# `churner-ai/report-preview`. The build never fetches from GitHub, so a
-# private repository needs no CodeBuild source credential.
+# stack's CodeBuild project, runs it as its own Fargate service through the
+# stack's controller function, registers `<pr>.<preview-zone>`, and reports
+# every state change to Churner through `churner-ai/report-preview`. The
+# build never fetches from GitHub, so a private repository needs no CodeBuild
+# source credential.
+#
+# Fargate is the only runtime. There is no shared preview host and no SSM
+# path: every preview is one ECS service, scaled to zero when idle and woken
+# by its next request.
 #
 # A commit with no `Dockerfile` at its root has no app to preview yet: the job
 # builds nothing, reports nothing, says so in its summary, and passes.
 #
 # ## Everything it does, it does with the deployer role's enumerated grants
 #
-#   s3:PutObject                      upload the source tarball, under
-#                                     `build-contexts/` of the stack's bucket
+#   s3:PutObject                      upload the source tarball (and the
+#                                     seed file), under `build-contexts/`
+#                                     of the stack's bucket
 #   codebuild:StartBuild              start the image build
 #   codebuild:BatchGetBuilds          poll it to a terminal phase, and read
 #                                     the registry URI out of the build's own
 #                                     resolved environment (no ECR call)
-#   ssm:DescribeInstanceInformation   find the churner-preview-host by tag
-#   ssm:SendCommand                   run the host script on it
-#   ssm:GetCommandInvocation          read that command's result BY ID
+#   lambda:InvokeFunction             deploy / destroy / read the status of
+#                                     a preview through the stack's own
+#                                     controller function, and nothing else
 #
-# and nothing else — no ECR, no RDS, no Secrets Manager. A test derives both
-# sets (the calls in this file, the actions in the policy) and asserts they
-# are EQUAL, so an unused grant is as much a failure as an ungranted call.
-# The role holds no `ListCommands` / `ListCommandInvocations`: enumeration
-# turns "read my own command" into "read every command any principal ever
-# sent", which a deploy that knows its own id needs none of.
+# and nothing else — no ECR, no RDS, no Secrets Manager, no SSM. A test
+# derives both sets (the calls in this file, the actions in the policy) and
+# asserts they are EQUAL, so an unused grant is as much a failure as an
+# ungranted call.
 #
 # ## Secrets never reach the runner
 #
-# The database master password and the application's secrets are read ON THE
-# HOST, by the host's own instance profile, inside the script SSM runs. The
-# runner holds exactly one credential — the Churner preview token — and it
-# crosses only as an action input, never a command line.
+# The database master password and the application's secrets are injected by
+# ECS under the stack's own task execution role. The runner holds exactly one
+# credential — the Churner preview token — and it crosses only as an action
+# input, never a command line.
 #
 # This file is authored in the churner monorepo under
 # `github-actions/preview-workflow/`; `shared/tests/preview-workflow.test.ts`
-# asserts its interface, its action pins and its script checksums.
+# asserts its interface and its action pins.
 
 name: Churner preview
 
@@ -47,7 +51,7 @@ on:
   workflow_call:
     inputs:
       project:
-        description: Churner project key, e.g. `MC`.
+        description: Churner project key, e.g. `ACME`.
         required: true
         type: string
       preview-zone:
@@ -98,8 +102,8 @@ on:
       ttl-hours:
         description: >-
           How long the preview is expected to live. Mirrors the module's
-          `PreviewTtlHours`; the host stamps it onto the container as
-          `churner.preview.expires_at` and the TTL reaper enforces it. At the
+          `PreviewTtlHours`; the controller stamps it onto the preview's
+          service and the stack's sweep enforces it. At the
           value 48, the "Fetch preview settings" step fetches whatever the
           project's Previews settings card has saved and uses THAT instead —
           the same live channel `max-open-previews` already has. Set this to
@@ -114,64 +118,42 @@ on:
       max-open-previews:
         description: >-
           Mirrors the module's `PreviewMaxOpenPreviews` — the most previews
-          that may be open at once, empty for no limit. Unlike the module's
-          own value (baked into the host at first boot, so it moves only on
-          a re-apply that REPLACES the host under CloudFormation), this input
-          reaches `deploy-preview.sh` on every run and wins over whatever the
-          host booted with, so a changed limit takes effect on the very next
-          pull-request push, with no host replacement. Left empty, the
-          "Fetch preview settings" step fetches whatever the project's
-          Previews settings card has saved and uses THAT instead; set this
-          explicitly and it wins over the fetched value. An un-upgraded
-          caller workflow (one that predates the settings-fetch step) simply
-          gets no fetched value and defers to the host's own bootstrapped
-          value, rather than silently clearing it.
+          that may be open at once, empty for no limit. It reaches the
+          controller on every run, so a changed limit takes effect on the
+          very next pull-request push; a deploy past it is QUEUED, never
+          refused. Left empty, the "Fetch preview settings" step fetches
+          whatever the project's Previews settings card has saved and uses
+          THAT instead; set this explicitly and it wins over the fetched
+          value.
         required: false
         type: string
         default: ''
+      runtime:
+        description: >-
+          Where previews run. `fargate` — one Fargate service per pull
+          request, deployed through the stack's controller function — is the
+          only runtime; any other value is refused before anything is built.
+          Churner's callers pass it explicitly.
+        required: false
+        type: string
+        default: fargate
+      controller-function:
+        description: >-
+          The stack's controller function, its `PreviewControllerFunctionName`
+          output. The deployer role may invoke this function and nothing else.
+        required: true
+        type: string
       tracker-url:
         description: Base URL of your Churner instance. Must be https.
         required: false
         type: string
         default: https://churner.ai
-      host-instance-id:
-        description: >-
-          OVERRIDE. Leave it empty: the host is found by its
-          `churner-preview-host=true` tag, and the stack creates exactly one,
-          so a hand-copied id is a value that goes stale the moment the host
-          is replaced. Set it only in an account running more than one
-          preview host, where the tag alone is ambiguous.
-        required: false
-        type: string
-        default: ''
-      scripts-base-url:
-        description: >-
-          Where the host scripts are fetched from. A PINNED, IMMUTABLE TAG on
-          the PUBLIC `churner-ai/preview-stack` repository, never a branch —
-          the host runs what it fetches, as root, and fetches it with an
-          unauthenticated curl. It is the same repository the preview stack's
-          own `PreviewScriptsBaseUrl` names, possibly a LATER tag of it (one
-          that changed only these scripts, so hosts need not be replaced).
-          Tags on this repository are never re-pointed
-          once published — a script change cuts a new tag — so a pin and the
-          bytes it names can never disagree. Override it only if you vendor
-          the scripts, and re-pin their checksums with it.
-        required: false
-        type: string
-        default: https://raw.githubusercontent.com/churner-ai/preview-stack/refs/tags/v3
     secrets:
       preview-token:
         description: >-
           The project's Churner preview token, minted in the project's Access
           settings and stored as a repository secret.
         required: true
-
-# SHA-256 of the two host scripts, verified on the host BEFORE either is
-# executed. A test asserts both against the files' actual bytes, so a script
-# edited without re-pinning fails CI rather than failing on a customer's host.
-env:
-  CHURNER_DEPLOY_SCRIPT_SHA256: c80848306ef80059e7719f275431fd90a801f10d15f88ad2bc997e21facc3903
-  CHURNER_DESTROY_SCRIPT_SHA256: c8e43bcbd6a9271c4e7876d0aac621fb4ea54a10aa2143caac0abf05509b35b0
 
 jobs:
   deploy:
@@ -186,6 +168,18 @@ jobs:
       id-token: write
       contents: read
     steps:
+      # v6 runs previews on Fargate only. A caller still asking for the
+      # retired host runtime is told so here, before anything is built or
+      # reported, rather than failing somewhere less legible.
+      - name: Check the runtime
+        env:
+          RUNTIME: ${{ inputs.runtime }}
+        run: |
+          if [ "$RUNTIME" != "fargate" ]; then
+            echo "::error::runtime '${RUNTIME}' is not supported: previews run on Fargate only (runtime: fargate, with controller-function set to the stack's PreviewControllerFunctionName output)"
+            exit 1
+          fi
+
       # The head commit, not the merge commit: `.churner/preview/` is read
       # from it, and the record's identity is `(project, pr, sha)`.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -235,107 +229,50 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
           role-session-name: churner-preview-retire-${{ github.event.pull_request.number }}
 
-      - name: Retire an earlier preview of this pull request
-        id: retire
+      # The same, on Fargate: ask the controller whether this pull request
+      # has a preview, and destroy it only if it does. Fail-soft likewise.
+      - name: Retire an earlier Fargate preview of this pull request
+        id: retire-fargate
         if: steps.app.outputs.present == 'false' && steps.credentials-retire.outcome == 'success'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
-          SCRIPTS_BASE_URL: ${{ inputs.scripts-base-url }}
+          CONTROLLER_FUNCTION: ${{ inputs.controller-function }}
         run: |
           set -uo pipefail
 
-          skip() { echo "::warning::could not check for an earlier preview of this pull request ($1); the TTL reaper removes any left behind"; exit 0; }
+          skip() { echo "::warning::could not check for an earlier preview of this pull request ($1); the stack's sweep removes any left behind"; exit 0; }
 
           case "$PR_NUMBER" in
             ""|*[!0-9]*) skip "unusable pull-request number" ;;
           esac
-          case "$SCRIPTS_BASE_URL" in
-            https://*) ;;
-            *) skip "scripts-base-url must be https" ;;
-          esac
-          case "$SCRIPTS_BASE_URL" in
-            *[!A-Za-z0-9._/:-]*) skip "scripts-base-url contains a character a URL of this shape cannot hold" ;;
+          case "$CONTROLLER_FUNCTION" in
+            ""|*[!A-Za-z0-9_-]*) skip "controller-function must be the stack's controller function name" ;;
           esac
 
-          # The container name is the host's own (`destroy-preview.sh`), so
-          # "this pull request has a preview" is asked of the host, not
-          # guessed. Nothing is torn down unless it exists.
-          remote="$(cat <<REMOTE
-          set -euo pipefail
-          if ! docker inspect 'churner-preview-pr-${PR_NUMBER}' >/dev/null 2>&1; then
-            echo 'churner-preview-none'
+          jq -n --arg pr "$PR_NUMBER" '{action: "status", pr: $pr}' > "${RUNNER_TEMP}/status.json" || skip "could not build the request"
+          aws lambda invoke \
+            --function-name "$CONTROLLER_FUNCTION" \
+            --cli-binary-format raw-in-base64-out \
+            --payload "file://${RUNNER_TEMP}/status.json" \
+            "${RUNNER_TEMP}/status-out.json" >/dev/null || skip "the controller could not be reached"
+          if [ "$(jq -r '.exists // false' "${RUNNER_TEMP}/status-out.json")" != "true" ]; then
+            echo "Pull request #${PR_NUMBER} has no preview to remove."
             exit 0
           fi
-          export CHURNER_PR='${PR_NUMBER}'
-          script="\$(mktemp)"
-          trap 'rm -f "\$script"' EXIT
-          curl -fsSL '${SCRIPTS_BASE_URL}/host/destroy-preview.sh' -o "\$script"
-          echo '${CHURNER_DESTROY_SCRIPT_SHA256}  '"\$script" | sha256sum -c -
-          bash "\$script"
-          echo 'churner-preview-torn-down'
-          REMOTE
-          )"
 
-          jq -n --arg s "$remote" '{commands: [$s]}' > "${RUNNER_TEMP}/ssm.json" || skip "could not build the command"
+          jq -n --arg pr "$PR_NUMBER" '{action: "destroy", pr: $pr}' > "${RUNNER_TEMP}/destroy.json" || skip "could not build the request"
+          aws lambda invoke \
+            --function-name "$CONTROLLER_FUNCTION" \
+            --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 330 \
+            --payload "file://${RUNNER_TEMP}/destroy.json" \
+            "${RUNNER_TEMP}/destroy-out.json" >/dev/null || skip "the controller could not be reached"
+          [ "$(jq -r '.ok // false' "${RUNNER_TEMP}/destroy-out.json")" = "true" ] \
+            || skip "$(jq -r '.error // "the controller refused"' "${RUNNER_TEMP}/destroy-out.json")"
+          echo "Removed the preview an earlier commit of pull request #${PR_NUMBER} left running."
+          echo 'torn-down=true' >> "$GITHUB_OUTPUT"
 
-          if [ -n "$HOST_INSTANCE_ID" ]; then
-            instance_id="$HOST_INSTANCE_ID"
-          else
-            # SC2016: the backticks are JMESPath, and single quotes are
-            # exactly what stops the shell from running `Online` as a
-            # command. Double quotes here would be the bug.
-            # shellcheck disable=SC2016
-            instance_id="$(
-              aws ssm describe-instance-information \
-                --filters Key=tag:churner-preview-host,Values=true \
-                --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
-                --output text
-            )" || skip "the preview host could not be looked up"
-          fi
-          matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
-          [ "$matches" = "1" ] || skip "expected exactly one Online preview host, found ${matches}"
-
-          command_id="$(
-            aws ssm send-command \
-              --document-name AWS-RunShellScript \
-              --instance-ids "$instance_id" \
-              --timeout-seconds 300 \
-              --comment "churner preview retire pr-${PR_NUMBER}" \
-              --parameters "file://${RUNNER_TEMP}/ssm.json" \
-              --query 'Command.CommandId' --output text
-          )" || skip "the command could not be sent"
-
-          invocation='{}'
-          state=Pending
-          for _ in $(seq 1 60); do
-            invocation="$(
-              aws ssm get-command-invocation \
-                --command-id "$command_id" \
-                --instance-id "$instance_id" \
-                --output json 2>/dev/null || printf '{}'
-            )"
-            state="$(printf '%s' "$invocation" | jq -r '.Status // "Pending"')"
-            case "$state" in
-              Success|Failed|Cancelled|TimedOut) break ;;
-            esac
-            sleep 5
-          done
-          [ "$state" = "Success" ] || skip "the host reported ${state}"
-
-          out="$(printf '%s' "$invocation" | jq -r '.StandardOutputContent // ""')"
-          printf '%s\n' "$out"
-          case "$out" in
-            *churner-preview-torn-down*)
-              echo "Removed the preview an earlier commit of pull request #${PR_NUMBER} left running."
-              echo 'torn-down=true' >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "Pull request #${PR_NUMBER} has no preview to remove."
-              ;;
-          esac
-
-      - if: steps.retire.outputs.torn-down == 'true'
+      - if: steps.retire-fargate.outputs.torn-down == 'true'
         continue-on-error: true
         uses: churner-ai/report-preview@v1
         with:
@@ -401,6 +338,10 @@ jobs:
           archive="${HEAD_SHA}.tar.gz"
           key="build-contexts/${REPOSITORY}/${PR_NUMBER}/${archive}"
           git archive --format=tar.gz -o "${RUNNER_TEMP}/${archive}" "$HEAD_SHA"
+          # Every commit is its own image tag, so the controller can delete
+          # exactly this pull request's earlier images once this one serves
+          # (a single reused tag would leave each earlier image untagged).
+          image_tag="pr-${PR_NUMBER}-$(printf '%s' "$HEAD_SHA" | cut -c1-12 | tr 'A-F' 'a-f')"
           # A stack applied before the bucket existed answers NoSuchBucket (or
           # AccessDenied — the role predates the grant too). Churner does not
           # move a repository onto this version until the stack reports the
@@ -435,7 +376,7 @@ jobs:
               --project-name "$CODEBUILD_PROJECT" \
               --source-location-override "${BUILD_CONTEXT_BUCKET}/${key}" \
               --environment-variables-override \
-                "name=IMAGE_TAG,value=pr-${PR_NUMBER},type=PLAINTEXT" \
+                "name=IMAGE_TAG,value=${image_tag},type=PLAINTEXT" \
                 "name=SOURCE_ARCHIVE,value=${archive},type=PLAINTEXT" \
               --query 'build.id' --output text
           )"
@@ -487,18 +428,22 @@ jobs:
           fi
           {
             echo 'image-uri<<CHURNER_OUTPUT_EOF'
-            echo "${repo_uri}:pr-${PR_NUMBER}"
+            echo "${repo_uri}:${image_tag}"
+            echo 'CHURNER_OUTPUT_EOF'
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo 'image-tag<<CHURNER_OUTPUT_EOF'
+            echo "$image_tag"
             echo 'CHURNER_OUTPUT_EOF'
           } >> "$GITHUB_OUTPUT"
 
       # UX review batch F, Must 1 — the durable settings channel. Reads what
       # the settings card has SAVED (`GET …/previews/settings`, authenticated
       # by the same preview token every other CI call uses) so a cap or TTL
-      # set there reaches an EXISTING host on the very next push, with no
+      # set there reaches the controller on the very next push, with no
       # re-apply. Fail-SOFT: a tracker outage must never fail a preview
       # deploy, so a failed fetch just leaves this run on the explicit
-      # workflow inputs / the host's own bootstrap defaults — exactly the
-      # behaviour before this channel existed.
+      # workflow inputs and the stack's own defaults.
       - name: Fetch preview settings
         id: settings
         if: steps.app.outputs.present == 'true'
@@ -546,7 +491,7 @@ jobs:
           # to regardless. Previously this fell through SILENTLY, with
           # nothing logged, whenever the body was non-empty but malformed.
           if [ -z "$fetched_ttl" ] && [ -z "$fetched_max_open" ]; then
-            echo "::warning::could not fetch preview settings from ${TRACKER_URL} — using this run's own inputs and the host's bootstrap defaults"
+            echo "::warning::could not fetch preview settings from ${TRACKER_URL} — using this run's own inputs and the stack's own defaults"
           fi
 
           # An EXPLICIT workflow input — one that differs from its schema
@@ -578,8 +523,12 @@ jobs:
             echo 'CHURNER_OUTPUT_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Run it on the preview host
-        id: deploy
+      # The Fargate runtime: the stack's controller function registers the
+      # image as this pull request's task, creates or updates its service and
+      # routes `<pr>.<preview-zone>` to it. Secrets are injected by ECS under
+      # the stack's own task execution role; the runner never holds one.
+      - name: Run it on Fargate
+        id: deploy-fargate
         if: steps.app.outputs.present == 'true'
         env:
           IMAGE_URI: ${{ steps.build.outputs.image-uri }}
@@ -588,64 +537,46 @@ jobs:
           TTL_HOURS: ${{ steps.settings.outputs.ttl-hours }}
           MAX_OPEN_PREVIEWS: ${{ steps.settings.outputs.max-open-previews }}
           PREVIEW_ZONE: ${{ inputs.preview-zone }}
-          SECRETS_PREFIX: ${{ inputs.secrets-prefix }}
-          HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
-          SCRIPTS_BASE_URL: ${{ inputs.scripts-base-url }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+          CONTROLLER_FUNCTION: ${{ inputs.controller-function }}
+          BUILD_CONTEXT_BUCKET: ${{ inputs.build-context-bucket }}
+          REPOSITORY: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
 
-          # Everything that will be interpolated into the SSM body is checked
-          # HERE, before the body is built and before any AWS call. All of it
-          # lands inside single quotes in a script that runs as root on a
-          # shared host, so one apostrophe is a shell escape — and a refusal
-          # is only useful if it happens before the command is sent.
-          case "$IMAGE_URI" in
-            ""|*[!A-Za-z0-9._/:-]*) echo "::error::refusing an unusable image reference"; exit 1 ;;
+          case "$CONTROLLER_FUNCTION" in
+            ""|*[!A-Za-z0-9_-]*) echo "::error::controller-function must be the stack's controller function name (its PreviewControllerFunctionName output)"; exit 1 ;;
           esac
           case "$TTL_HOURS" in
             ""|*[!0-9]*) echo "::error::ttl-hours must be a whole number of hours (got '${TTL_HOURS}')"; exit 1 ;;
           esac
-          # Empty is legal here — it means "this call states no cap", which
-          # defers to the host's own bootstrapped value (see deploy-preview.sh)
-          # rather than the workflow input schema's default silently clearing
-          # a cap configured on the module.
           case "$MAX_OPEN_PREVIEWS" in
             '') ;;
             *[!0-9]*) echo "::error::max-open-previews must be a whole number of open previews, or empty for no limit (got '${MAX_OPEN_PREVIEWS}')"; exit 1 ;;
           esac
-          case "$SECRETS_PREFIX" in
-            ""|*[!A-Za-z0-9_/-]*) echo "::error::secrets-prefix must be letters, digits, '_', '-' and '/' (got '${SECRETS_PREFIX}')"; exit 1 ;;
-          esac
           case "$PREVIEW_ZONE" in
             ""|*[!a-z0-9.-]*) echo "::error::preview-zone must be a lower-case DNS name (got '${PREVIEW_ZONE}')"; exit 1 ;;
           esac
-          case "$SCRIPTS_BASE_URL" in
-            https://*) ;;
-            *) echo "::error::scripts-base-url must be https — the host runs what it fetches, as root"; exit 1 ;;
-          esac
-          case "$SCRIPTS_BASE_URL" in
-            *[!A-Za-z0-9._/:-]*) echo "::error::scripts-base-url contains a character a URL of this shape cannot hold"; exit 1 ;;
-          esac
 
           # Repository conventions, both optional. See docs/customer/preview-seed.md.
-          seed_b64=''
+          seed_key=''
           if [ -f .churner/preview/seed.sql ]; then
             seed_bytes="$(wc -c < .churner/preview/seed.sql | tr -d '[:space:]')"
-            # The seed rides inside the SSM command body, whose parameters are
-            # capped near 100 KB in total; base64 adds a third on top. Refused
-            # here, by name, rather than as an opaque AWS ValidationException.
             if [ "$seed_bytes" -gt 60000 ]; then
-              echo "::error::.churner/preview/seed.sql is ${seed_bytes} bytes; the limit is 60000 because it travels inside one SSM command. Move the bulk into a migration your app runs at boot."
+              echo "::error::.churner/preview/seed.sql is ${seed_bytes} bytes; the limit is 60000. Move the bulk into a migration your app runs at boot."
               exit 1
             fi
-            seed_b64="$(base64 -w0 .churner/preview/seed.sql)"
+            seed_key="build-contexts/${REPOSITORY}/${PR_NUMBER}/${HEAD_SHA}.seed.sql"
+            aws s3api put-object \
+              --bucket "$BUILD_CONTEXT_BUCKET" \
+              --key "$seed_key" \
+              --body .churner/preview/seed.sql \
+              --output text >/dev/null
             echo "Seeding from .churner/preview/seed.sql (${seed_bytes} bytes)"
           fi
 
-          # REJECTED, not scrubbed. Silently deleting the offending characters
-          # turns `MY KEY` into `MYKEY` and injects a secret nobody named;
-          # a customer who typo'd a line wants to be told, not corrected.
-          secret_keys=''
+          # REJECTED, not scrubbed: a name the controller could not inject is an error here, not a silent drop.
+          secret_keys='[]'
           if [ -f .churner/preview/secrets ]; then
             while IFS= read -r line || [ -n "$line" ]; do
               line="${line%$'\r'}"
@@ -654,9 +585,6 @@ jobs:
               case "$line" in
                 ''|'#'*) continue ;;
               esac
-              # `NAME` (the secret must exist) or `NAME:generate` (a secret
-              # the app owns; the host creates it when absent). The token
-              # travels as written; the host strips the suffix.
               case "$line" in
                 *:generate) name="${line%:generate}" ;;
                 *:*) echo "::error file=.churner/preview/secrets::'${line}' has an unknown suffix (the only one understood is ':generate')"; exit 1 ;;
@@ -669,122 +597,84 @@ jobs:
               case "$name" in
                 *[!A-Za-z0-9_]*) echo "::error file=.churner/preview/secrets::'${line}' is not an environment-variable name (letters, digits and underscore only)"; exit 1 ;;
               esac
-              secret_keys="${secret_keys}${line} "
+              secret_keys="$(printf '%s' "$secret_keys" | jq -c --arg k "$line" '. + [$k]')"
             done < .churner/preview/secrets
-            echo "Secrets to inject: ${secret_keys:-none}"
+            echo "Secrets to inject: ${secret_keys}"
           fi
 
-          # Fetched from a pinned tag and checksum-verified before it runs, so
-          # the host executes only bytes someone reviewed. A heredoc here
-          # instead would be a program the tests could never execute.
-          remote="$(cat <<REMOTE
-          set -euo pipefail
-          export CHURNER_PR='${PR_NUMBER}'
-          export CHURNER_SHA='${HEAD_SHA}'
-          export CHURNER_IMAGE_URI='${IMAGE_URI}'
-          export CHURNER_TTL_HOURS='${TTL_HOURS}'
-          export CHURNER_MAX_OPEN_PREVIEWS='${MAX_OPEN_PREVIEWS}'
-          export CHURNER_SECRETS_PREFIX='${SECRETS_PREFIX}'
-          export CHURNER_SECRET_KEYS='${secret_keys}'
-          export CHURNER_SEED_B64='${seed_b64}'
-          script="\$(mktemp)"
-          trap 'rm -f "\$script"' EXIT
-          curl -fsSL '${SCRIPTS_BASE_URL}/host/deploy-preview.sh' -o "\$script"
-          echo '${CHURNER_DEPLOY_SCRIPT_SHA256}  '"\$script" | sha256sum -c -
-          bash "\$script"
-          REMOTE
-          )"
+          jq -n \
+            --arg pr "$PR_NUMBER" \
+            --arg sha "$HEAD_SHA" \
+            --arg image "$IMAGE_URI" \
+            --arg health "$HEALTH_PATH" \
+            --arg ttl "$TTL_HOURS" \
+            --arg cap "$MAX_OPEN_PREVIEWS" \
+            --arg seed "$seed_key" \
+            --argjson keys "$secret_keys" \
+            '{action: "deploy", pr: $pr, sha: $sha, image: $image, healthPath: $health, ttlHours: $ttl, maxOpenPreviews: $cap, secretKeys: $keys, seedKey: $seed}' \
+            > "${RUNNER_TEMP}/deploy.json"
 
-          jq -n --arg s "$remote" '{commands: [$s]}' > "${RUNNER_TEMP}/ssm.json"
+          aws lambda invoke \
+            --function-name "$CONTROLLER_FUNCTION" \
+            --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 330 \
+            --payload "file://${RUNNER_TEMP}/deploy.json" \
+            "${RUNNER_TEMP}/deploy-out.json" >/dev/null
 
-          # The host is found by its tag, not configured by hand: the stack
-          # creates exactly one, and an id copied into a caller's workflow
-          # goes stale the moment the host is replaced. `host-instance-id` is
-          # an override for an account that runs more than one.
-          if [ -n "$HOST_INSTANCE_ID" ]; then
-            instance_id="$HOST_INSTANCE_ID"
-          else
-            # SC2016: the backticks are JMESPath, and single quotes are
-            # exactly what stops the shell from running `Online` as a
-            # command. Double quotes here would be the bug.
-            # shellcheck disable=SC2016
-            instance_id="$(
-              aws ssm describe-instance-information \
-                --filters Key=tag:churner-preview-host,Values=true \
-                --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
-                --output text
-            )"
-          fi
-          matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
-          if [ "$matches" != "1" ]; then
-            echo "::error::expected exactly one Online instance tagged churner-preview-host=true, found ${matches}. Is the host up and registered with SSM? Pass host-instance-id to choose between several."
+          if [ "$(jq -r '.ok // false' "${RUNNER_TEMP}/deploy-out.json")" != "true" ]; then
+            reason="$(jq -r '.error // "the controller returned no answer"' "${RUNNER_TEMP}/deploy-out.json")"
+            {
+              echo 'failure-reason<<CHURNER_OUTPUT_EOF'
+              echo "${reason#churner-preview-cap-reached: }"
+              echo 'CHURNER_OUTPUT_EOF'
+            } >> "$GITHUB_OUTPUT"
+            echo "::error::the controller refused the deploy: ${reason}"
             exit 1
           fi
-          echo "Preview host: ${instance_id}"
 
-          command_id="$(
-            aws ssm send-command \
-              --document-name AWS-RunShellScript \
-              --instance-ids "$instance_id" \
-              --timeout-seconds 600 \
-              --comment "churner preview pr-${PR_NUMBER}" \
-              --parameters "file://${RUNNER_TEMP}/ssm.json" \
-              --query 'Command.CommandId' --output text
-          )"
-          echo "Sent ${command_id}"
-
+          # The address is derived here from the zone, and must equal
+          # what the controller routed — never taken from its answer alone.
           url="https://${PR_NUMBER}.${PREVIEW_ZONE}"
+          answered="$(jq -r '.url // ""' "${RUNNER_TEMP}/deploy-out.json")"
+          if [ "$answered" != "$url" ]; then
+            echo "::error::the controller routed ${answered}, not ${url}"
+            exit 1
+          fi
           {
             echo 'url<<CHURNER_OUTPUT_EOF'
             echo "$url"
             echo 'CHURNER_OUTPUT_EOF'
           } >> "$GITHUB_OUTPUT"
 
-          invocation='{}'
-          state=Pending
-          for _ in $(seq 1 120); do
-            invocation="$(
-              aws ssm get-command-invocation \
-                --command-id "$command_id" \
-                --instance-id "$instance_id" \
-                --output json 2>/dev/null || printf '{}'
-            )"
-            state="$(printf '%s' "$invocation" | jq -r '.Status // "Pending"')"
-            case "$state" in
-              Success|Failed|Cancelled|TimedOut) break ;;
-            esac
-            sleep 5
-          done
-
-          err="$(printf '%s' "$invocation" | jq -r '.StandardErrorContent // ""')"
-          printf '%s' "$invocation" | jq -r '.StandardOutputContent // ""'
-          printf '%s' "$err" >&2
-          if [ "$state" != "Success" ]; then
-            # The host's OWN reason when it refused deliberately, so the record
-            # in Churner says "the cap was reached" instead of the catch-all.
-            reason="$(printf '%s' "$err" | grep -m1 'churner-preview-cap-reached:' || true)"
-            if [ -n "$reason" ]; then
-              {
-                echo 'failure-reason<<CHURNER_OUTPUT_EOF'
-                echo "${reason#*churner-preview-cap-reached: }"
-                echo 'CHURNER_OUTPUT_EOF'
-              } >> "$GITHUB_OUTPUT"
-            fi
-            echo "::error::the host reported ${state} for the deploy command"
-            exit 1
+          # Every preview slot is taken: the controller QUEUED this preview
+          # instead of refusing it. Nothing failed — the record says
+          # `queued`, and the controller starts the preview and reports it
+          # `ready` when another preview closes or expires.
+          if [ "$(jq -r '.queued // false' "${RUNNER_TEMP}/deploy-out.json")" = "true" ]; then
+            open="$(jq -r '.open // ""' "${RUNNER_TEMP}/deploy-out.json")"
+            limit="$(jq -r '.limit // ""' "${RUNNER_TEMP}/deploy-out.json")"
+            position="$(jq -r '.position // ""' "${RUNNER_TEMP}/deploy-out.json")"
+            echo "queued=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Waiting for a preview slot: ${open} previews are open and the limit is ${limit} (position ${position} in line). It starts by itself when a slot frees."
+            {
+              echo '### Waiting for a preview slot'
+              echo
+              echo "${open} previews are open and this project's limit is ${limit}. This preview is number ${position} in line and starts by itself when another pull request closes or its preview expires; Churner is told when it is ready."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # `ready` is a promise that the URL ANSWERS, so it is posted after this
       # gate and never before. 60 attempts, each up to 10s of connect plus a
-      # 5s pause — so between 5 minutes (a host that refuses fast) and 15 (one
+      # 5s pause — so between 5 minutes (a preview that refuses fast) and 15 (one
       # that hangs). Wide enough for a cold image pull and an application boot.
       # No `-L`: a redirect to somewhere else answering 200 is not this
       # preview answering, and following one would report a stranger's page
       # as ready.
       - name: Wait for the preview to answer
-        if: steps.app.outputs.present == 'true'
+        id: gate
+        if: steps.app.outputs.present == 'true' && steps.deploy-fargate.outputs.queued != 'true'
         env:
-          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+          PREVIEW_URL: ${{ steps.deploy-fargate.outputs.url }}
           HEALTH_PATH: ${{ inputs.health-path }}
         run: |
           set -euo pipefail
@@ -799,7 +689,66 @@ jobs:
           echo "::error::${target} never answered"
           exit 1
 
-      - if: steps.app.outputs.present == 'true'
+      # This commit's preview serves: the pull request's earlier images and
+      # source archives are deleted now, in this step — never left for a
+      # lifecycle sweep. The controller deletes nothing until the service's
+      # rollout has replaced the previous commit's task, so this waits for
+      # that briefly. Fail-soft: a skipped clean-up never fails a preview,
+      # and destroying the preview deletes whatever is left.
+      - name: Delete this pull request's superseded images
+        if: steps.gate.outcome == 'success'
+        continue-on-error: true
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          IMAGE_TAG: ${{ steps.build.outputs.image-tag }}
+          CONTROLLER_FUNCTION: ${{ inputs.controller-function }}
+        run: |
+          set -uo pipefail
+          jq -n --arg pr "$PR_NUMBER" --arg tag "$IMAGE_TAG" '{action: "live", pr: $pr, imageTag: $tag}' > "${RUNNER_TEMP}/live.json"
+          for _ in $(seq 1 40); do
+            aws lambda invoke \
+              --function-name "$CONTROLLER_FUNCTION" \
+              --cli-binary-format raw-in-base64-out \
+              --payload "file://${RUNNER_TEMP}/live.json" \
+              "${RUNNER_TEMP}/live-out.json" >/dev/null || { echo "::warning::the controller could not be reached; the images go when the preview is destroyed"; exit 0; }
+            if [ "$(jq -r '.waiting // false' "${RUNNER_TEMP}/live-out.json")" != "true" ]; then
+              jq -c '{pruned, reason, images}' "${RUNNER_TEMP}/live-out.json"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::warning::the rollout had not finished; the earlier images go with the next commit or when the preview is destroyed"
+
+      # A Fargate preview that never answered usually says why itself: its
+      # task stopped (out of memory, the app exited, the database setup
+      # failed). The controller reads the task's own stop reason, so the
+      # record says "out of memory (limit 1024 MiB)" instead of the catch-all.
+      - name: Read why the preview did not answer
+        id: diagnose
+        if: failure() && steps.gate.outcome == 'failure'
+        continue-on-error: true
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CONTROLLER_FUNCTION: ${{ inputs.controller-function }}
+        run: |
+          set -uo pipefail
+          jq -n --arg pr "$PR_NUMBER" '{action: "status", pr: $pr}' > "${RUNNER_TEMP}/status.json"
+          aws lambda invoke \
+            --function-name "$CONTROLLER_FUNCTION" \
+            --cli-binary-format raw-in-base64-out \
+            --payload "file://${RUNNER_TEMP}/status.json" \
+            "${RUNNER_TEMP}/status-out.json" >/dev/null || exit 0
+          reason="$(jq -r '.failure // ""' "${RUNNER_TEMP}/status-out.json")"
+          if [ -n "$reason" ]; then
+            echo "::error::the preview stopped: ${reason}"
+            {
+              echo 'failure-reason<<CHURNER_OUTPUT_EOF'
+              echo "$reason"
+              echo 'CHURNER_OUTPUT_EOF'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.app.outputs.present == 'true' && steps.deploy-fargate.outputs.queued != 'true'
         uses: churner-ai/report-preview@v1
         with:
           token: ${{ secrets.preview-token }}
@@ -807,7 +756,21 @@ jobs:
           type: ready
           pr: ${{ github.event.pull_request.number }}
           sha: ${{ github.event.pull_request.head.sha }}
-          url: ${{ steps.deploy.outputs.url }}
+          url: ${{ steps.deploy-fargate.outputs.url }}
+          health-path: ${{ inputs.health-path }}
+          expires-in: ${{ steps.settings.outputs.ttl-hours }}h
+          tracker-url: ${{ inputs.tracker-url }}
+          build-log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - if: steps.app.outputs.present == 'true' && steps.deploy-fargate.outputs.queued == 'true'
+        uses: churner-ai/report-preview@v1
+        with:
+          token: ${{ secrets.preview-token }}
+          project: ${{ inputs.project }}
+          type: queued
+          pr: ${{ github.event.pull_request.number }}
+          sha: ${{ github.event.pull_request.head.sha }}
+          url: ${{ steps.deploy-fargate.outputs.url }}
           health-path: ${{ inputs.health-path }}
           expires-in: ${{ steps.settings.outputs.ttl-hours }}h
           tracker-url: ${{ inputs.tracker-url }}
@@ -828,7 +791,7 @@ jobs:
           type: failed
           pr: ${{ github.event.pull_request.number }}
           sha: ${{ github.event.pull_request.head.sha }}
-          error: ${{ steps.deploy.outputs.failure-reason || 'The preview pipeline failed before the preview answered.' }}
+          error: ${{ steps.deploy-fargate.outputs.failure-reason || steps.diagnose.outputs.failure-reason || 'The preview pipeline failed before the preview answered.' }}
           tracker-url: ${{ inputs.tracker-url }}
           build-log-url: ${{ steps.build.outputs.log-url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
 
@@ -845,90 +808,46 @@ jobs:
       id-token: write
       contents: read
     steps:
+      # v6 runs previews on Fargate only. A caller still asking for the
+      # retired host runtime is told so here, before anything is built or
+      # reported, rather than failing somewhere less legible.
+      - name: Check the runtime
+        env:
+          RUNTIME: ${{ inputs.runtime }}
+        run: |
+          if [ "$RUNTIME" != "fargate" ]; then
+            echo "::error::runtime '${RUNTIME}' is not supported: previews run on Fargate only (runtime: fargate, with controller-function set to the stack's PreviewControllerFunctionName output)"
+            exit 1
+          fi
+
       - uses: aws-actions/configure-aws-credentials@796449b3e38e3c256861227399e58b780e0e5538 # v6
         with:
           role-to-assume: ${{ inputs.role-arn }}
           aws-region: ${{ inputs.aws-region }}
           role-session-name: churner-preview-teardown-${{ github.event.pull_request.number }}
 
-      - name: Tear the preview down
+      - name: Tear the Fargate preview down
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
-          SCRIPTS_BASE_URL: ${{ inputs.scripts-base-url }}
+          CONTROLLER_FUNCTION: ${{ inputs.controller-function }}
         run: |
           set -euo pipefail
-
-          # Same checks as the deploy step, for the same reason: the value is
-          # about to be interpolated into a script that runs as root.
-          case "$SCRIPTS_BASE_URL" in
-            https://*) ;;
-            *) echo "::error::scripts-base-url must be https"; exit 1 ;;
+          case "$PR_NUMBER" in
+            ""|*[!0-9]*) echo "::error::refusing an unusable pull-request number"; exit 1 ;;
           esac
-          case "$SCRIPTS_BASE_URL" in
-            *[!A-Za-z0-9._/:-]*) echo "::error::scripts-base-url contains a character a URL of this shape cannot hold"; exit 1 ;;
+          case "$CONTROLLER_FUNCTION" in
+            ""|*[!A-Za-z0-9_-]*) echo "::error::controller-function must be the stack's controller function name"; exit 1 ;;
           esac
-
-          remote="$(cat <<REMOTE
-          set -euo pipefail
-          export CHURNER_PR='${PR_NUMBER}'
-          script="\$(mktemp)"
-          trap 'rm -f "\$script"' EXIT
-          curl -fsSL '${SCRIPTS_BASE_URL}/host/destroy-preview.sh' -o "\$script"
-          echo '${CHURNER_DESTROY_SCRIPT_SHA256}  '"\$script" | sha256sum -c -
-          bash "\$script"
-          REMOTE
-          )"
-
-          jq -n --arg s "$remote" '{commands: [$s]}' > "${RUNNER_TEMP}/ssm.json"
-
-          if [ -n "$HOST_INSTANCE_ID" ]; then
-            instance_id="$HOST_INSTANCE_ID"
-          else
-            # SC2016: the backticks are JMESPath, and single quotes are
-            # exactly what stops the shell from running `Online` as a
-            # command. Double quotes here would be the bug.
-            # shellcheck disable=SC2016
-            instance_id="$(
-              aws ssm describe-instance-information \
-                --filters Key=tag:churner-preview-host,Values=true \
-                --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
-                --output text
-            )"
+          jq -n --arg pr "$PR_NUMBER" '{action: "destroy", pr: $pr}' > "${RUNNER_TEMP}/destroy.json"
+          aws lambda invoke \
+            --function-name "$CONTROLLER_FUNCTION" \
+            --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 330 \
+            --payload "file://${RUNNER_TEMP}/destroy.json" \
+            "${RUNNER_TEMP}/destroy-out.json" >/dev/null
+          if [ "$(jq -r '.ok // false' "${RUNNER_TEMP}/destroy-out.json")" != "true" ]; then
+            echo "::warning::teardown refused: $(jq -r '.error // "no answer"' "${RUNNER_TEMP}/destroy-out.json"); the stack's sweep removes it at its TTL"
           fi
-          matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
-          if [ "$matches" != "1" ]; then
-            echo "::error::expected exactly one Online instance tagged churner-preview-host=true, found ${matches}. The preview will be reaped at its TTL instead."
-            exit 1
-          fi
-
-          command_id="$(
-            aws ssm send-command \
-              --document-name AWS-RunShellScript \
-              --instance-ids "$instance_id" \
-              --timeout-seconds 300 \
-              --comment "churner preview teardown pr-${PR_NUMBER}" \
-              --parameters "file://${RUNNER_TEMP}/ssm.json" \
-              --query 'Command.CommandId' --output text
-          )"
-          echo "Sent ${command_id}"
-
-          state=Pending
-          for _ in $(seq 1 60); do
-            invocation="$(
-              aws ssm get-command-invocation \
-                --command-id "$command_id" \
-                --instance-id "$instance_id" \
-                --output json 2>/dev/null || printf '{}'
-            )"
-            state="$(printf '%s' "$invocation" | jq -r '.Status // "Pending"')"
-            case "$state" in
-              Success|Failed|Cancelled|TimedOut) break ;;
-            esac
-            sleep 5
-          done
-          echo "Teardown command finished ${state}"
-          [ "$state" = "Success" ] || echo "::warning::teardown reported ${state}; the TTL reaper is the backstop"
 
       # `always()`, and `destroyed` is accepted from anywhere by the contract:
       # a teardown that could not run is still a preview nobody should be
