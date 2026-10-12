@@ -9,4 +9,4 @@ workflow's test suite (`shared/tests/preview-workflow.test.ts`).
 From v6 previews run on Fargate only, through the preview stack's controller
 function; the workflow fetches no script from anywhere.
 
-Released from churner monorepo commit `9e4f625a1`.
+Released from churner monorepo commit `54d8efe33`.

@@ -9,6 +9,14 @@ the deployer role the stack created, in your account, under your identity.
 
 ## Changelog
 
+- **v7** — new optional input `runs-on` (JSON; default `"ubuntu-latest"`)
+  picks the runner both jobs run on, so a repository whose GitHub-hosted
+  runners are unavailable can run its previews on its own self-hosted
+  runners. Each job runs in a per-pull-request concurrency group with
+  `cancel-in-progress`, the run number is sent to the controller as
+  `runOrder` on `deploy` and `live`, and a deploy the controller answers
+  `superseded` (a newer run already serves this preview) passes without
+  reporting anything. A caller passing no `runs-on` behaves as on v6.
 - **v6** — previews run on Fargate only. Each pull request is one ECS
   service with its own CPU and memory limit, deployed through the stack's
   controller function, put to sleep after the stack's idle time and woken by
@@ -35,12 +43,16 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, closed]
 
+concurrency:
+  group: preview-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   preview:
     permissions:
       id-token: write     # mint the OIDC assertion for the deployer role
       contents: read      # check out the pull request's head commit
-    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v6
+    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v7
     with:
       project: ACME
       preview-zone: preview.example.com
@@ -87,6 +99,7 @@ stack's trust policy:
 | `runtime` | no | `fargate` | Where previews run. `fargate` is the only value; anything else fails the job before it builds. New in v6. |
 | `controller-function` | yes | — | The stack's `PreviewControllerFunctionName` output. The deployer role may invoke this function and nothing else. New in v6. |
 | `tracker-url` | no | `https://churner.ai` | Base URL of your Churner instance. https only. |
+| `runs-on` | no | `"ubuntu-latest"` | The runner both jobs run on, as JSON: a label string, or an array of a self-hosted runner's labels, e.g. `'["self-hosted","linux","x64"]'`. A self-hosted runner needs bash, git, curl, jq and AWS CLI v2 on PATH (no Docker: CodeBuild builds the image), and egress to GitHub, AWS and your Churner instance. New in v7. |
 
 | Secret | Required | Meaning |
 |---|---|---|

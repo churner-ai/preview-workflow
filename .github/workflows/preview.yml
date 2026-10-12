@@ -148,6 +148,18 @@ on:
         required: false
         type: string
         default: https://churner.ai
+      runs-on:
+        description: >-
+          The runner both jobs run on, as JSON: a label string
+          (`"ubuntu-latest"`, the default — a GitHub-hosted runner) or an
+          array of labels a self-hosted runner carries, e.g.
+          `["self-hosted","linux","x64"]`. A self-hosted runner needs bash,
+          git, curl, jq and AWS CLI v2 on PATH — what GitHub's `ubuntu-latest`
+          image carries and every step here calls without a setup step; no
+          Docker (CodeBuild builds the image). New in v7.
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
     secrets:
       preview-token:
         description: >-
@@ -159,7 +171,14 @@ jobs:
   deploy:
     name: Preview
     if: github.event.action != 'closed'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    # One run of a pull request's preview at a time, even when the caller
+    # sets no concurrency of its own: a preview is named by its pull request
+    # alone. Its own group name, never the caller's, so a caller that does
+    # set one cannot deadlock against it.
+    concurrency:
+      group: churner-preview-job-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     # A build polls for 30 minutes and the readiness gate for up to 15; past
     # 45 the job is not slow, it is stuck, and a stuck job holds a runner and
     # leaves the record at `building` with nothing to report it.
@@ -534,6 +553,7 @@ jobs:
           IMAGE_URI: ${{ steps.build.outputs.image-uri }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ORDER: ${{ github.run_number }}
           TTL_HOURS: ${{ steps.settings.outputs.ttl-hours }}
           MAX_OPEN_PREVIEWS: ${{ steps.settings.outputs.max-open-previews }}
           PREVIEW_ZONE: ${{ inputs.preview-zone }}
@@ -610,8 +630,9 @@ jobs:
             --arg ttl "$TTL_HOURS" \
             --arg cap "$MAX_OPEN_PREVIEWS" \
             --arg seed "$seed_key" \
+            --arg order "$RUN_ORDER" \
             --argjson keys "$secret_keys" \
-            '{action: "deploy", pr: $pr, sha: $sha, image: $image, healthPath: $health, ttlHours: $ttl, maxOpenPreviews: $cap, secretKeys: $keys, seedKey: $seed}' \
+            '{action: "deploy", pr: $pr, sha: $sha, image: $image, healthPath: $health, ttlHours: $ttl, maxOpenPreviews: $cap, secretKeys: $keys, seedKey: $seed, runOrder: $order}' \
             > "${RUNNER_TEMP}/deploy.json"
 
           aws lambda invoke \
@@ -620,6 +641,15 @@ jobs:
             --cli-read-timeout 330 \
             --payload "file://${RUNNER_TEMP}/deploy.json" \
             "${RUNNER_TEMP}/deploy-out.json" >/dev/null
+
+          # A newer run of this pull request already deployed its commit:
+          # this run's older commit is not put back on the preview. Nothing
+          # failed, and nothing is reported for it.
+          if [ "$(jq -r '.superseded // false' "${RUNNER_TEMP}/deploy-out.json")" = "true" ]; then
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$(jq -r '.error // "a newer run already deployed this preview"' "${RUNNER_TEMP}/deploy-out.json")"
+            exit 0
+          fi
 
           if [ "$(jq -r '.ok // false' "${RUNNER_TEMP}/deploy-out.json")" != "true" ]; then
             reason="$(jq -r '.error // "the controller returned no answer"' "${RUNNER_TEMP}/deploy-out.json")"
@@ -672,7 +702,7 @@ jobs:
       # as ready.
       - name: Wait for the preview to answer
         id: gate
-        if: steps.app.outputs.present == 'true' && steps.deploy-fargate.outputs.queued != 'true'
+        if: steps.app.outputs.present == 'true' && steps.deploy-fargate.outputs.queued != 'true' && steps.deploy-fargate.outputs.superseded != 'true'
         env:
           PREVIEW_URL: ${{ steps.deploy-fargate.outputs.url }}
           HEALTH_PATH: ${{ inputs.health-path }}
@@ -702,9 +732,10 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           IMAGE_TAG: ${{ steps.build.outputs.image-tag }}
           CONTROLLER_FUNCTION: ${{ inputs.controller-function }}
+          RUN_ORDER: ${{ github.run_number }}
         run: |
           set -uo pipefail
-          jq -n --arg pr "$PR_NUMBER" --arg tag "$IMAGE_TAG" '{action: "live", pr: $pr, imageTag: $tag}' > "${RUNNER_TEMP}/live.json"
+          jq -n --arg pr "$PR_NUMBER" --arg tag "$IMAGE_TAG" --arg order "$RUN_ORDER" '{action: "live", pr: $pr, imageTag: $tag, runOrder: $order}' > "${RUNNER_TEMP}/live.json"
           for _ in $(seq 1 40); do
             aws lambda invoke \
               --function-name "$CONTROLLER_FUNCTION" \
@@ -748,7 +779,7 @@ jobs:
             } >> "$GITHUB_OUTPUT"
           fi
 
-      - if: steps.app.outputs.present == 'true' && steps.deploy-fargate.outputs.queued != 'true'
+      - if: steps.app.outputs.present == 'true' && steps.deploy-fargate.outputs.queued != 'true' && steps.deploy-fargate.outputs.superseded != 'true'
         uses: churner-ai/report-preview@v1
         with:
           token: ${{ secrets.preview-token }}
@@ -802,7 +833,14 @@ jobs:
   teardown:
     name: Preview teardown
     if: github.event.action == 'closed'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    # One run of a pull request's preview at a time, even when the caller
+    # sets no concurrency of its own: a preview is named by its pull request
+    # alone. Its own group name, never the caller's, so a caller that does
+    # set one cannot deadlock against it.
+    concurrency:
+      group: churner-preview-job-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     timeout-minutes: 15
     permissions:
       id-token: write
