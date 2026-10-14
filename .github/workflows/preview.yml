@@ -2,12 +2,14 @@
 #
 # A customer calls this from a short workflow of their own (see README.md).
 # It uploads the pull request's head commit (a `git archive` of the checkout,
-# no history) to the preview stack's build-context bucket, builds it on the
-# stack's CodeBuild project, runs it as its own Fargate service through the
-# stack's controller function, registers `<pr>.<preview-zone>`, and reports
-# every state change to Churner through `churner-ai/report-preview`. The
-# build never fetches from GitHub, so a private repository needs no CodeBuild
-# source credential.
+# no history) to the preview stack's build-context bucket, reports `building`
+# to Churner through `churner-ai/report-preview`, starts the image build on
+# the stack's CodeBuild project — and ends. It does not wait for the build:
+# the deploy request rides on the build, and when the build finishes the
+# stack's own events function deploys it as this pull request's Fargate
+# service at `<pr>.<preview-zone>`, waits for it to answer, and reports
+# `ready`, `queued` or `failed` to Churner itself. The build never fetches
+# from GitHub, so a private repository needs no CodeBuild source credential.
 #
 # Fargate is the only runtime. There is no shared preview host and no SSM
 # path: every preview is one ECS service, scaled to zero when idle and woken
@@ -22,17 +24,16 @@
 #                                     seed file), under `build-contexts/`
 #                                     of the stack's bucket
 #   codebuild:StartBuild              start the image build
-#   codebuild:BatchGetBuilds          poll it to a terminal phase, and read
-#                                     the registry URI out of the build's own
-#                                     resolved environment (no ECR call)
-#   lambda:InvokeFunction             deploy / destroy / read the status of
+#   lambda:InvokeFunction             retire / destroy / read the status of
 #                                     a preview through the stack's own
 #                                     controller function, and nothing else
 #
 # and nothing else — no ECR, no RDS, no Secrets Manager, no SSM. A test
 # derives both sets (the calls in this file, the actions in the policy) and
 # asserts they are EQUAL, so an unused grant is as much a failure as an
-# ungranted call.
+# ungranted call — less `codebuild:BatchGetBuilds`, which the role keeps for
+# callers still on v7 (which polls its own build) and this version no longer
+# calls.
 #
 # ## Secrets never reach the runner
 #
@@ -179,10 +180,10 @@ jobs:
     concurrency:
       group: churner-preview-job-${{ github.repository }}-${{ github.event.pull_request.number }}
       cancel-in-progress: true
-    # A build polls for 30 minutes and the readiness gate for up to 15; past
-    # 45 the job is not slow, it is stuck, and a stuck job holds a runner and
-    # leaves the record at `building` with nothing to report it.
-    timeout-minutes: 45
+    # The job uploads the commit and starts its build; it waits for neither
+    # the build nor the preview. Past 10 minutes it is not slow, it is stuck,
+    # and a stuck job holds a runner and leaves the record at `building`.
+    timeout-minutes: 10
     permissions:
       id-token: write
       contents: read
@@ -323,146 +324,14 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
           role-session-name: churner-preview-${{ github.event.pull_request.number }}
 
-      - name: Build the image
-        id: build
-        if: steps.app.outputs.present == 'true'
-        env:
-          CODEBUILD_PROJECT: ${{ inputs.codebuild-project }}
-          BUILD_CONTEXT_BUCKET: ${{ inputs.build-context-bucket }}
-          REPOSITORY: ${{ github.event.repository.name }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-
-          # Checked before anything is uploaded: each lands in an S3 key or
-          # a CodeBuild argument, and a refusal is only useful up front.
-          case "$BUILD_CONTEXT_BUCKET" in
-            ""|*[!a-z0-9.-]*) echo "::error::build-context-bucket must be an S3 bucket name (got '${BUILD_CONTEXT_BUCKET}')"; exit 1 ;;
-          esac
-          case "$REPOSITORY" in
-            ""|*[!A-Za-z0-9._-]*) echo "::error::refusing an unusable repository name"; exit 1 ;;
-          esac
-          case "$HEAD_SHA" in
-            ""|*[!0-9a-f]*) echo "::error::refusing an unusable head sha"; exit 1 ;;
-          esac
-          case "$PR_NUMBER" in
-            ""|*[!0-9]*) echo "::error::refusing an unusable pull-request number"; exit 1 ;;
-          esac
-
-          # The source comes from THIS checkout — the exact head commit, as a
-          # tarball with no history — never from a clone CodeBuild makes. So
-          # the build needs no GitHub credential of any kind, and a private
-          # repository needs no CodeBuild source credential.
-          archive="${HEAD_SHA}.tar.gz"
-          key="build-contexts/${REPOSITORY}/${PR_NUMBER}/${archive}"
-          git archive --format=tar.gz -o "${RUNNER_TEMP}/${archive}" "$HEAD_SHA"
-          # Every commit is its own image tag, so the controller can delete
-          # exactly this pull request's earlier images once this one serves
-          # (a single reused tag would leave each earlier image untagged).
-          image_tag="pr-${PR_NUMBER}-$(printf '%s' "$HEAD_SHA" | cut -c1-12 | tr 'A-F' 'a-f')"
-          # A stack applied before the bucket existed answers NoSuchBucket (or
-          # AccessDenied — the role predates the grant too). Churner does not
-          # move a repository onto this version until the stack reports the
-          # bucket, so this is the one-line reason if it happens anyway.
-          if ! upload_err="$(
-            aws s3api put-object \
-              --bucket "$BUILD_CONTEXT_BUCKET" \
-              --key "$key" \
-              --body "${RUNNER_TEMP}/${archive}" \
-              --output text 2>&1 >/dev/null
-          )"; then
-            case "$upload_err" in
-              *NoSuchBucket*|*AccessDenied*)
-                echo "::error::The build-context bucket ${BUILD_CONTEXT_BUCKET} doesn't exist yet, or this workflow's role can't write to it — apply the stack update from Churner's Infrastructure page."
-                ;;
-              *)
-                echo "::error::Uploading the build context to ${BUILD_CONTEXT_BUCKET} failed: ${upload_err}"
-                ;;
-            esac
-            exit 1
-          fi
-          echo "Uploaded s3://${BUILD_CONTEXT_BUCKET}/${key}"
-
-          # One provisioned project serves every pull request. Its own source
-          # is S3, at the bucket's `build-contexts/` prefix, so only the
-          # LOCATION is overridden (the type never changes, which is what
-          # keeps the project's inline buildspec); the tag rides as an
-          # environment override, and `SOURCE_ARCHIVE` tells the buildspec
-          # which file to unpack — CodeBuild extracts only a zip itself.
-          build_id="$(
-            aws codebuild start-build \
-              --project-name "$CODEBUILD_PROJECT" \
-              --source-location-override "${BUILD_CONTEXT_BUCKET}/${key}" \
-              --environment-variables-override \
-                "name=IMAGE_TAG,value=${image_tag},type=PLAINTEXT" \
-                "name=SOURCE_ARCHIVE,value=${archive},type=PLAINTEXT" \
-              --query 'build.id' --output text
-          )"
-          echo "Started CodeBuild ${build_id}"
-
-          json='{}'
-          status=IN_PROGRESS
-          # 120 x 15s = 30 minutes, past which a build is not slow, it is stuck.
-          for _ in $(seq 1 120); do
-            json="$(aws codebuild batch-get-builds --ids "$build_id" --output json)"
-            status="$(printf '%s' "$json" | jq -r '.builds[0].buildStatus // "IN_PROGRESS"')"
-            [ "$status" = "IN_PROGRESS" ] || break
-            sleep 15
-          done
-
-          # The console URL is assembled from the build's OWN arn, so no
-          # account-id lookup and no extra grant is needed for it.
-          arn="$(printf '%s' "$json" | jq -r '.builds[0].arn // ""')"
-          account="$(printf '%s' "$arn" | cut -d: -f5)"
-          region="$(printf '%s' "$arn" | cut -d: -f4)"
-          escaped_id="$(printf '%s' "$build_id" | sed 's/:/%3A/')"
-          log_url="https://${region}.console.aws.amazon.com/codesuite/codebuild/${account}/projects/${CODEBUILD_PROJECT}/build/${escaped_id}"
-          # Heredoc form, not `name=value`: a value containing a newline in
-          # the `name=value` form is read as further commands to the runner.
-          {
-            echo 'log-url<<CHURNER_OUTPUT_EOF'
-            echo "$log_url"
-            echo 'CHURNER_OUTPUT_EOF'
-          } >> "$GITHUB_OUTPUT"
-
-          if [ "$status" != "SUCCEEDED" ]; then
-            echo "::error::CodeBuild finished ${status} — ${log_url}"
-            exit 1
-          fi
-
-          # The registry URI comes out of the build's own resolved
-          # environment. Deriving it from the project key instead would mean
-          # re-implementing the module's ECR name-slug rule in shell, where a
-          # disagreement shows up as an image that cannot be pulled.
-          # Selected inside jq rather than with `| head -1`: `set -o pipefail`
-          # turns the SIGPIPE head sends into a failed step.
-          repo_uri="$(
-            printf '%s' "$json" \
-              | jq -r 'first(.builds[0].environment.environmentVariables[]? | select(.name == "ECR_REPOSITORY_URI") | .value) // ""'
-          )"
-          if [ -z "$repo_uri" ]; then
-            echo "::error::the build reported no ECR_REPOSITORY_URI — is this the preview stack's CodeBuild project?"
-            exit 1
-          fi
-          {
-            echo 'image-uri<<CHURNER_OUTPUT_EOF'
-            echo "${repo_uri}:${image_tag}"
-            echo 'CHURNER_OUTPUT_EOF'
-          } >> "$GITHUB_OUTPUT"
-          {
-            echo 'image-tag<<CHURNER_OUTPUT_EOF'
-            echo "$image_tag"
-            echo 'CHURNER_OUTPUT_EOF'
-          } >> "$GITHUB_OUTPUT"
-
-      # UX review batch F, Must 1 — the durable settings channel. Reads what
-      # the settings card has SAVED (`GET …/previews/settings`, authenticated
-      # by the same preview token every other CI call uses) so a cap or TTL
-      # set there reaches the controller on the very next push, with no
-      # re-apply. Fail-SOFT: a tracker outage must never fail a preview
-      # deploy, so a failed fetch just leaves this run on the explicit
-      # workflow inputs and the stack's own defaults.
+      # The durable settings channel. Reads what the settings card has SAVED
+      # (`GET …/previews/settings`, authenticated by the same preview token
+      # every other CI call uses) so a cap or TTL set there reaches the
+      # controller on the very next push, with no re-apply. Fail-SOFT: a
+      # tracker outage must never fail a preview deploy, so a failed fetch
+      # just leaves this run on the explicit workflow inputs and the stack's
+      # own defaults. Read BEFORE the build starts: the deploy request rides
+      # on the build.
       - name: Fetch preview settings
         id: settings
         if: steps.app.outputs.present == 'true'
@@ -486,11 +355,10 @@ jobs:
           # The token reaches curl through a CONFIG FILE on stdin (`-K -`),
           # never as a `-H` argv entry — an argv is visible to every other
           # process on the runner (`ps`), a config file on a pipe is not.
-          # `--proto '=https'` (re-review round 3, code item 8): the
-          # `TRACKER_URL` input is caller-supplied, and without this curl
-          # would happily follow a scheme a caller mistyped or a redirect
-          # downgraded to, sending the bearer token in the config file over
-          # whatever protocol the URL names.
+          # `--proto '=https'`: the `TRACKER_URL` input is caller-supplied,
+          # and without this curl would happily follow a scheme a caller
+          # mistyped or a redirect downgraded to, sending the bearer token in
+          # the config file over whatever protocol the URL names.
           body="$(
             printf 'header = "Authorization: Bearer %s"\n' "$PREVIEW_TOKEN" \
               | curl -fsS --max-time 10 --proto '=https' -K - \
@@ -501,14 +369,12 @@ jobs:
             fetched_max_open="$(printf '%s' "$body" | jq -r '.maxOpenPreviews // empty' 2>/dev/null)" || fetched_max_open=""
           fi
           # A non-empty body that yielded NOTHING usable from either field
-          # is treated the same as an outright fetch failure (re-review
-          # round 3, code item 7): either the response was not this route's
-          # JSON shape (jq's own parse failure is swallowed by the `|| ...`
-          # fallbacks above, so this is the only signal left), or the
-          # project genuinely has neither value set — which means the
-          # module is not opted in, and this workflow has nothing to deploy
-          # to regardless. Previously this fell through SILENTLY, with
-          # nothing logged, whenever the body was non-empty but malformed.
+          # is treated the same as an outright fetch failure: either the
+          # response was not this route's JSON shape (jq's own parse failure
+          # is swallowed by the `|| ...` fallbacks above, so this is the only
+          # signal left), or the project genuinely has neither value set —
+          # which means the module is not opted in, and this workflow has
+          # nothing to deploy to regardless.
           if [ -z "$fetched_ttl" ] && [ -z "$fetched_max_open" ]; then
             echo "::warning::could not fetch preview settings from ${TRACKER_URL} — using this run's own inputs and the stack's own defaults"
           fi
@@ -517,9 +383,7 @@ jobs:
           # default — wins over the fetched value: a caller's own workflow
           # file is a deliberate override. GitHub Actions cannot tell "the
           # caller wrote this on purpose" from "the caller never mentioned
-          # it", so the schema default is the only observable signal —
-          # `max-open-previews` already made this exact tradeoff (Task 11 /
-          # fix round 1).
+          # it", so the schema default is the only observable signal.
           ttl_hours="$INPUT_TTL_HOURS"
           if [ "$ttl_hours" = "48" ] && [ -n "$fetched_ttl" ]; then
             ttl_hours="$fetched_ttl"
@@ -542,30 +406,47 @@ jobs:
             echo 'CHURNER_OUTPUT_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      # The Fargate runtime: the stack's controller function registers the
-      # image as this pull request's task, creates or updates its service and
-      # routes `<pr>.<preview-zone>` to it. Secrets are injected by ECS under
-      # the stack's own task execution role; the runner never holds one.
-      - name: Run it on Fargate
-        id: deploy-fargate
+      # Upload the commit, start its image build, and END. The runner does
+      # not wait for the build: the deploy request rides on the build as its
+      # `CHURNER_PREVIEW_REQUEST` environment variable, and when the build
+      # finishes the stack's own events function — handed the build by an
+      # EventBridge rule — deploys it as this pull request's Fargate service,
+      # waits for its address to answer, and reports `ready`, `queued` or
+      # `failed` to Churner itself (a failed build with its CodeBuild log).
+      # Secrets are injected by ECS under the stack's own task execution
+      # role; the runner never holds one.
+      - name: Start the image build
+        id: build
         if: steps.app.outputs.present == 'true'
         env:
-          IMAGE_URI: ${{ steps.build.outputs.image-uri }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CODEBUILD_PROJECT: ${{ inputs.codebuild-project }}
+          BUILD_CONTEXT_BUCKET: ${{ inputs.build-context-bucket }}
+          REPOSITORY: ${{ github.event.repository.name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           RUN_ORDER: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TTL_HOURS: ${{ steps.settings.outputs.ttl-hours }}
           MAX_OPEN_PREVIEWS: ${{ steps.settings.outputs.max-open-previews }}
           PREVIEW_ZONE: ${{ inputs.preview-zone }}
           HEALTH_PATH: ${{ inputs.health-path }}
-          CONTROLLER_FUNCTION: ${{ inputs.controller-function }}
-          BUILD_CONTEXT_BUCKET: ${{ inputs.build-context-bucket }}
-          REPOSITORY: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
 
-          case "$CONTROLLER_FUNCTION" in
-            ""|*[!A-Za-z0-9_-]*) echo "::error::controller-function must be the stack's controller function name (its PreviewControllerFunctionName output)"; exit 1 ;;
+          # Checked before anything is uploaded: each lands in an S3 key, a
+          # CodeBuild argument or the deploy request, and a refusal is only
+          # useful up front.
+          case "$BUILD_CONTEXT_BUCKET" in
+            ""|*[!a-z0-9.-]*) echo "::error::build-context-bucket must be an S3 bucket name (got '${BUILD_CONTEXT_BUCKET}')"; exit 1 ;;
+          esac
+          case "$REPOSITORY" in
+            ""|*[!A-Za-z0-9._-]*) echo "::error::refusing an unusable repository name"; exit 1 ;;
+          esac
+          case "$HEAD_SHA" in
+            ""|*[!0-9a-f]*) echo "::error::refusing an unusable head sha"; exit 1 ;;
+          esac
+          case "$PR_NUMBER" in
+            ""|*[!0-9]*) echo "::error::refusing an unusable pull-request number"; exit 1 ;;
           esac
           case "$TTL_HOURS" in
             ""|*[!0-9]*) echo "::error::ttl-hours must be a whole number of hours (got '${TTL_HOURS}')"; exit 1 ;;
@@ -587,12 +468,6 @@ jobs:
               exit 1
             fi
             seed_key="build-contexts/${REPOSITORY}/${PR_NUMBER}/${HEAD_SHA}.seed.sql"
-            aws s3api put-object \
-              --bucket "$BUILD_CONTEXT_BUCKET" \
-              --key "$seed_key" \
-              --body .churner/preview/seed.sql \
-              --output text >/dev/null
-            echo "Seeding from .churner/preview/seed.sql (${seed_bytes} bytes)"
           fi
 
           # REJECTED, not scrubbed: a name the controller could not inject is an error here, not a silent drop.
@@ -622,198 +497,124 @@ jobs:
             echo "Secrets to inject: ${secret_keys}"
           fi
 
+          # The source comes from THIS checkout — the exact head commit, as a
+          # tarball with no history — never from a clone CodeBuild makes. So
+          # the build needs no GitHub credential of any kind, and a private
+          # repository needs no CodeBuild source credential.
+          archive="${HEAD_SHA}.tar.gz"
+          key="build-contexts/${REPOSITORY}/${PR_NUMBER}/${archive}"
+          git archive --format=tar.gz -o "${RUNNER_TEMP}/${archive}" "$HEAD_SHA"
+          # Every commit is its own image tag, so the controller can delete
+          # exactly this pull request's earlier images once this one serves
+          # (a single reused tag would leave each earlier image untagged).
+          image_tag="pr-${PR_NUMBER}-$(printf '%s' "$HEAD_SHA" | cut -c1-12 | tr 'A-F' 'a-f')"
+
+          # The seed goes up first: the build's source archive is what the
+          # controller checks is still there before deploying, so once the
+          # archive is uploaded everything the deploy reads is in place.
+          if [ -n "$seed_key" ]; then
+            aws s3api put-object \
+              --bucket "$BUILD_CONTEXT_BUCKET" \
+              --key "$seed_key" \
+              --body .churner/preview/seed.sql \
+              --output text >/dev/null
+            echo "Seeding from .churner/preview/seed.sql (${seed_bytes} bytes)"
+          fi
+          # A stack applied before the bucket existed answers NoSuchBucket (or
+          # AccessDenied — the role predates the grant too). Churner does not
+          # move a repository onto this version until the stack reports the
+          # bucket, so this is the one-line reason if it happens anyway.
+          if ! upload_err="$(
+            aws s3api put-object \
+              --bucket "$BUILD_CONTEXT_BUCKET" \
+              --key "$key" \
+              --body "${RUNNER_TEMP}/${archive}" \
+              --output text 2>&1 >/dev/null
+          )"; then
+            case "$upload_err" in
+              *NoSuchBucket*|*AccessDenied*)
+                echo "::error::The build-context bucket ${BUILD_CONTEXT_BUCKET} doesn't exist yet, or this workflow's role can't write to it — apply the stack update from Churner's Infrastructure page."
+                ;;
+              *)
+                echo "::error::Uploading the build context to ${BUILD_CONTEXT_BUCKET} failed: ${upload_err}"
+                ;;
+            esac
+            exit 1
+          fi
+          echo "Uploaded s3://${BUILD_CONTEXT_BUCKET}/${key}"
+
+          # What the controller deploys once the build succeeds — the same
+          # fields its `deploy` action takes, less the image (the build's own
+          # tag in the stack's own registry, which the controller assembles).
+          request="$(
+            jq -cn \
+              --arg pr "$PR_NUMBER" \
+              --arg sha "$HEAD_SHA" \
+              --arg health "$HEALTH_PATH" \
+              --arg ttl "$TTL_HOURS" \
+              --arg cap "$MAX_OPEN_PREVIEWS" \
+              --arg seed "$seed_key" \
+              --arg order "$RUN_ORDER" \
+              --arg run "$RUN_URL" \
+              --argjson keys "$secret_keys" \
+              '{pr: $pr, sha: $sha, healthPath: $health, ttlHours: $ttl, maxOpenPreviews: $cap, secretKeys: $keys, seedKey: $seed, runOrder: $order, runUrl: $run}'
+          )"
+          # A file, not the CLI's `name=…,value=…` shorthand: the request is
+          # JSON, and the shorthand splits on its commas.
           jq -n \
-            --arg pr "$PR_NUMBER" \
-            --arg sha "$HEAD_SHA" \
-            --arg image "$IMAGE_URI" \
-            --arg health "$HEALTH_PATH" \
-            --arg ttl "$TTL_HOURS" \
-            --arg cap "$MAX_OPEN_PREVIEWS" \
-            --arg seed "$seed_key" \
-            --arg order "$RUN_ORDER" \
-            --argjson keys "$secret_keys" \
-            '{action: "deploy", pr: $pr, sha: $sha, image: $image, healthPath: $health, ttlHours: $ttl, maxOpenPreviews: $cap, secretKeys: $keys, seedKey: $seed, runOrder: $order}' \
-            > "${RUNNER_TEMP}/deploy.json"
+            --arg tag "$image_tag" \
+            --arg archive "$archive" \
+            --arg request "$request" \
+            '[{name: "IMAGE_TAG", value: $tag, type: "PLAINTEXT"},
+              {name: "SOURCE_ARCHIVE", value: $archive, type: "PLAINTEXT"},
+              {name: "CHURNER_PREVIEW_REQUEST", value: $request, type: "PLAINTEXT"}]' \
+            > "${RUNNER_TEMP}/build-environment.json"
 
-          aws lambda invoke \
-            --function-name "$CONTROLLER_FUNCTION" \
-            --cli-binary-format raw-in-base64-out \
-            --cli-read-timeout 330 \
-            --payload "file://${RUNNER_TEMP}/deploy.json" \
-            "${RUNNER_TEMP}/deploy-out.json" >/dev/null
+          # One provisioned project serves every pull request. Its own source
+          # is S3, at the bucket's `build-contexts/` prefix, so only the
+          # LOCATION is overridden (the type never changes, which is what
+          # keeps the project's inline buildspec); `SOURCE_ARCHIVE` tells the
+          # buildspec which file to unpack — CodeBuild extracts only a zip.
+          build_arn="$(
+            aws codebuild start-build \
+              --project-name "$CODEBUILD_PROJECT" \
+              --source-location-override "${BUILD_CONTEXT_BUCKET}/${key}" \
+              --environment-variables-override "file://${RUNNER_TEMP}/build-environment.json" \
+              --query 'build.arn' --output text
+          )"
 
-          # A newer run of this pull request already deployed its commit:
-          # this run's older commit is not put back on the preview. Nothing
-          # failed, and nothing is reported for it.
-          if [ "$(jq -r '.superseded // false' "${RUNNER_TEMP}/deploy-out.json")" = "true" ]; then
-            echo "superseded=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::$(jq -r '.error // "a newer run already deployed this preview"' "${RUNNER_TEMP}/deploy-out.json")"
-            exit 0
-          fi
-
-          if [ "$(jq -r '.ok // false' "${RUNNER_TEMP}/deploy-out.json")" != "true" ]; then
-            reason="$(jq -r '.error // "the controller returned no answer"' "${RUNNER_TEMP}/deploy-out.json")"
-            {
-              echo 'failure-reason<<CHURNER_OUTPUT_EOF'
-              echo "${reason#churner-preview-cap-reached: }"
-              echo 'CHURNER_OUTPUT_EOF'
-            } >> "$GITHUB_OUTPUT"
-            echo "::error::the controller refused the deploy: ${reason}"
-            exit 1
-          fi
-
-          # The address is derived here from the zone, and must equal
-          # what the controller routed — never taken from its answer alone.
-          url="https://${PR_NUMBER}.${PREVIEW_ZONE}"
-          answered="$(jq -r '.url // ""' "${RUNNER_TEMP}/deploy-out.json")"
-          if [ "$answered" != "$url" ]; then
-            echo "::error::the controller routed ${answered}, not ${url}"
-            exit 1
-          fi
+          # The console URL is assembled from the build's OWN arn, so no
+          # account-id lookup and no extra grant is needed for it.
+          account="$(printf '%s' "$build_arn" | cut -d: -f5)"
+          region="$(printf '%s' "$build_arn" | cut -d: -f4)"
+          build_id="${build_arn#*:build/}"
+          escaped_id="$(printf '%s' "$build_id" | sed 's/:/%3A/')"
+          log_url="https://${region}.console.aws.amazon.com/codesuite/codebuild/${account}/projects/${CODEBUILD_PROJECT}/build/${escaped_id}"
+          echo "Started CodeBuild ${build_id} — ${log_url}"
+          # Heredoc form, not `name=value`: a value containing a newline in
+          # the `name=value` form is read as further commands to the runner.
           {
-            echo 'url<<CHURNER_OUTPUT_EOF'
-            echo "$url"
+            echo 'log-url<<CHURNER_OUTPUT_EOF'
+            echo "$log_url"
+            echo 'CHURNER_OUTPUT_EOF'
+            echo 'image-tag<<CHURNER_OUTPUT_EOF'
+            echo "$image_tag"
             echo 'CHURNER_OUTPUT_EOF'
           } >> "$GITHUB_OUTPUT"
-
-          # Every preview slot is taken: the controller QUEUED this preview
-          # instead of refusing it. Nothing failed — the record says
-          # `queued`, and the controller starts the preview and reports it
-          # `ready` when another preview closes or expires.
-          if [ "$(jq -r '.queued // false' "${RUNNER_TEMP}/deploy-out.json")" = "true" ]; then
-            open="$(jq -r '.open // ""' "${RUNNER_TEMP}/deploy-out.json")"
-            limit="$(jq -r '.limit // ""' "${RUNNER_TEMP}/deploy-out.json")"
-            position="$(jq -r '.position // ""' "${RUNNER_TEMP}/deploy-out.json")"
-            echo "queued=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Waiting for a preview slot: ${open} previews are open and the limit is ${limit} (position ${position} in line). It starts by itself when a slot frees."
-            {
-              echo '### Waiting for a preview slot'
-              echo
-              echo "${open} previews are open and this project's limit is ${limit}. This preview is number ${position} in line and starts by itself when another pull request closes or its preview expires; Churner is told when it is ready."
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      # `ready` is a promise that the URL ANSWERS, so it is posted after this
-      # gate and never before. 60 attempts, each up to 10s of connect plus a
-      # 5s pause — so between 5 minutes (a preview that refuses fast) and 15 (one
-      # that hangs). Wide enough for a cold image pull and an application boot.
-      # No `-L`: a redirect to somewhere else answering 200 is not this
-      # preview answering, and following one would report a stranger's page
-      # as ready.
-      - name: Wait for the preview to answer
-        id: gate
-        if: steps.app.outputs.present == 'true' && steps.deploy-fargate.outputs.queued != 'true' && steps.deploy-fargate.outputs.superseded != 'true'
-        env:
-          PREVIEW_URL: ${{ steps.deploy-fargate.outputs.url }}
-          HEALTH_PATH: ${{ inputs.health-path }}
-        run: |
-          set -euo pipefail
-          target="${PREVIEW_URL}${HEALTH_PATH}"
-          for _ in $(seq 1 60); do
-            code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$target" || printf '000')"
-            case "$code" in
-              2*|3*) echo "${target} answered ${code}"; exit 0 ;;
-            esac
-            sleep 5
-          done
-          echo "::error::${target} never answered"
-          exit 1
-
-      # This commit's preview serves: the pull request's earlier images and
-      # source archives are deleted now, in this step — never left for a
-      # lifecycle sweep. The controller deletes nothing until the service's
-      # rollout has replaced the previous commit's task, so this waits for
-      # that briefly. Fail-soft: a skipped clean-up never fails a preview,
-      # and destroying the preview deletes whatever is left.
-      - name: Delete this pull request's superseded images
-        if: steps.gate.outcome == 'success'
-        continue-on-error: true
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          IMAGE_TAG: ${{ steps.build.outputs.image-tag }}
-          CONTROLLER_FUNCTION: ${{ inputs.controller-function }}
-          RUN_ORDER: ${{ github.run_number }}
-        run: |
-          set -uo pipefail
-          jq -n --arg pr "$PR_NUMBER" --arg tag "$IMAGE_TAG" --arg order "$RUN_ORDER" '{action: "live", pr: $pr, imageTag: $tag, runOrder: $order}' > "${RUNNER_TEMP}/live.json"
-          for _ in $(seq 1 40); do
-            aws lambda invoke \
-              --function-name "$CONTROLLER_FUNCTION" \
-              --cli-binary-format raw-in-base64-out \
-              --payload "file://${RUNNER_TEMP}/live.json" \
-              "${RUNNER_TEMP}/live-out.json" >/dev/null || { echo "::warning::the controller could not be reached; the images go when the preview is destroyed"; exit 0; }
-            if [ "$(jq -r '.waiting // false' "${RUNNER_TEMP}/live-out.json")" != "true" ]; then
-              jq -c '{pruned, reason, images}' "${RUNNER_TEMP}/live-out.json"
-              exit 0
-            fi
-            sleep 15
-          done
-          echo "::warning::the rollout had not finished; the earlier images go with the next commit or when the preview is destroyed"
-
-      # A Fargate preview that never answered usually says why itself: its
-      # task stopped (out of memory, the app exited, the database setup
-      # failed). The controller reads the task's own stop reason, so the
-      # record says "out of memory (limit 1024 MiB)" instead of the catch-all.
-      - name: Read why the preview did not answer
-        id: diagnose
-        if: failure() && steps.gate.outcome == 'failure'
-        continue-on-error: true
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          CONTROLLER_FUNCTION: ${{ inputs.controller-function }}
-        run: |
-          set -uo pipefail
-          jq -n --arg pr "$PR_NUMBER" '{action: "status", pr: $pr}' > "${RUNNER_TEMP}/status.json"
-          aws lambda invoke \
-            --function-name "$CONTROLLER_FUNCTION" \
-            --cli-binary-format raw-in-base64-out \
-            --payload "file://${RUNNER_TEMP}/status.json" \
-            "${RUNNER_TEMP}/status-out.json" >/dev/null || exit 0
-          reason="$(jq -r '.failure // ""' "${RUNNER_TEMP}/status-out.json")"
-          if [ -n "$reason" ]; then
-            echo "::error::the preview stopped: ${reason}"
-            {
-              echo 'failure-reason<<CHURNER_OUTPUT_EOF'
-              echo "$reason"
-              echo 'CHURNER_OUTPUT_EOF'
-            } >> "$GITHUB_OUTPUT"
-          fi
-
-      - if: steps.app.outputs.present == 'true' && steps.deploy-fargate.outputs.queued != 'true' && steps.deploy-fargate.outputs.superseded != 'true'
-        uses: churner-ai/report-preview@v1
-        with:
-          token: ${{ secrets.preview-token }}
-          project: ${{ inputs.project }}
-          type: ready
-          pr: ${{ github.event.pull_request.number }}
-          sha: ${{ github.event.pull_request.head.sha }}
-          url: ${{ steps.deploy-fargate.outputs.url }}
-          health-path: ${{ inputs.health-path }}
-          expires-in: ${{ steps.settings.outputs.ttl-hours }}h
-          tracker-url: ${{ inputs.tracker-url }}
-          build-log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-      - if: steps.app.outputs.present == 'true' && steps.deploy-fargate.outputs.queued == 'true'
-        uses: churner-ai/report-preview@v1
-        with:
-          token: ${{ secrets.preview-token }}
-          project: ${{ inputs.project }}
-          type: queued
-          pr: ${{ github.event.pull_request.number }}
-          sha: ${{ github.event.pull_request.head.sha }}
-          url: ${{ steps.deploy-fargate.outputs.url }}
-          health-path: ${{ inputs.health-path }}
-          expires-in: ${{ steps.settings.outputs.ttl-hours }}h
-          tracker-url: ${{ inputs.tracker-url }}
-          build-log-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          {
+            echo '### Preview building'
+            echo
+            echo "Commit \`${HEAD_SHA}\` is building as \`${image_tag}\` ([build log](${log_url}))."
+            echo "When it finishes, the preview stack deploys it at https://${PR_NUMBER}.${PREVIEW_ZONE} and tells Churner when it answers — this job does not wait."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Without this the record sits at `building` forever, which reads as
-      # "still going" to everything downstream. The build log named is the
-      # CodeBuild one when there is a build to blame, and this run otherwise.
-      # `cancelled()` too: a cancelled run leaves the record at `building`
-      # just as surely as a failed one, and a job cancelled by the next push
-      # is the ordinary case, not the rare one. Never for a commit with no
-      # Dockerfile: nothing was attempted there, so nothing failed.
+      # "still going" to everything downstream. It covers what fails HERE,
+      # before the build started; once it has started, the stack's events
+      # function reports the build's outcome. `cancelled()` too: a cancelled
+      # run leaves the record at `building` just as surely as a failed one.
+      # Never for a commit with no Dockerfile: nothing was attempted there,
+      # so nothing failed.
       - if: (failure() || cancelled()) && steps.app.outputs.present != 'false'
         uses: churner-ai/report-preview@v1
         with:
@@ -822,7 +623,7 @@ jobs:
           type: failed
           pr: ${{ github.event.pull_request.number }}
           sha: ${{ github.event.pull_request.head.sha }}
-          error: ${{ steps.deploy-fargate.outputs.failure-reason || steps.diagnose.outputs.failure-reason || 'The preview pipeline failed before the preview answered.' }}
+          error: The preview pipeline failed before its image build started.
           tracker-url: ${{ inputs.tracker-url }}
           build-log-url: ${{ steps.build.outputs.log-url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
 
