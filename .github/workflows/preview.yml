@@ -352,6 +352,12 @@ jobs:
 
           fetched_ttl=""
           fetched_max_open=""
+          # Only a bare https origin is ever called with the token: no path,
+          # port, user-info or query a caller could smuggle another address in.
+          if ! [[ "$TRACKER_URL" =~ ^https://[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]; then
+            echo "::warning::tracker-url must be a bare https origin such as https://churner.ai (got '${TRACKER_URL}') — using this run's own inputs and the stack's own defaults"
+            TRACKER_URL=""
+          fi
           # The token reaches curl through a CONFIG FILE on stdin (`-K -`),
           # never as a `-H` argv entry — an argv is visible to every other
           # process on the runner (`ps`), a config file on a pipe is not.
@@ -359,11 +365,17 @@ jobs:
           # and without this curl would happily follow a scheme a caller
           # mistyped or a redirect downgraded to, sending the bearer token in
           # the config file over whatever protocol the URL names.
-          body="$(
-            printf 'header = "Authorization: Bearer %s"\n' "$PREVIEW_TOKEN" \
-              | curl -fsS --max-time 10 --proto '=https' -K - \
-                  "${TRACKER_URL}/api/projects/${PROJECT}/previews/settings" 2>/dev/null
-          )" || body=""
+          case "$PROJECT" in
+            ""|*[!A-Za-z0-9_-]*) TRACKER_URL="" ;;
+          esac
+          body=""
+          if [ -n "$TRACKER_URL" ]; then
+            body="$(
+              printf 'header = "Authorization: Bearer %s"\n' "$PREVIEW_TOKEN" \
+                | curl -fsS --max-time 10 --proto '=https' --max-redirs 0 -K - \
+                    "${TRACKER_URL}/api/projects/${PROJECT}/previews/settings" 2>/dev/null
+            )" || body=""
+          fi
           if [ -n "$body" ]; then
             fetched_ttl="$(printf '%s' "$body" | jq -r '.ttlHours // empty' 2>/dev/null)" || fetched_ttl=""
             fetched_max_open="$(printf '%s' "$body" | jq -r '.maxOpenPreviews // empty' 2>/dev/null)" || fetched_max_open=""
