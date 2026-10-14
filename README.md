@@ -19,7 +19,11 @@ the deployer role the stack created, in your account, under your identity.
   itself, then deletes the pull request's superseded images. A build that
   finishes after its pull request closed deploys nothing. The job's check no
   longer turns red when the preview fails after its build started: Churner's
-  preview record carries that. Same inputs as v7. Needs a stack that reports
+  preview record carries that, and Churner gates a ticket that needs the
+  preview on that record. The teardown job now FAILS when the stack refuses
+  the teardown, and reports `destroyed` only once the stack removed the
+  preview or committed to removing it. The settings fetch calls only a bare
+  `https://` tracker origin. Same inputs as v7. Needs a stack that reports
   `PreviewBuildEventsRuleName`; Churner moves a repository onto `@v8` only
   then.
 - **v7** — new optional input `runs-on` (JSON; default `"ubuntu-latest"`)
