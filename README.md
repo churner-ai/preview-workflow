@@ -22,8 +22,10 @@ the deployer role the stack created, in your account, under your identity.
   preview record carries that, and Churner gates a ticket that needs the
   preview on that record. The teardown job now FAILS when the stack refuses
   the teardown, and reports `destroyed` only once the stack removed the
-  preview or committed to removing it. The settings fetch calls only a bare
-  `https://` tracker origin. Same inputs as v7. Needs a stack that reports
+  preview or committed to removing it. A cancelled run (replaced by a newer
+  run of the same pull request) reports nothing — it is not a failure. The
+  settings fetch calls only a bare `https://` tracker origin. Same inputs as
+  v7. Needs a stack that reports
   `PreviewBuildEventsRuleName`; Churner moves a repository onto `@v8` only
   then.
 - **v7** — new optional input `runs-on` (JSON; default `"ubuntu-latest"`)

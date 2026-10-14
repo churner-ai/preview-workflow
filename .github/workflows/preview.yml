@@ -620,14 +620,16 @@ jobs:
             echo "When it finishes, the preview stack deploys it at https://${PR_NUMBER}.${PREVIEW_ZONE} and tells Churner when it answers — this job does not wait."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Without this the record sits at `building` forever, which reads as
-      # "still going" to everything downstream. It covers what fails HERE,
-      # before the build started; once it has started, the stack's events
-      # function reports the build's outcome. `cancelled()` too: a cancelled
-      # run leaves the record at `building` just as surely as a failed one.
-      # Never for a commit with no Dockerfile: nothing was attempted there,
-      # so nothing failed.
-      - if: (failure() || cancelled()) && steps.app.outputs.present != 'false'
+      # A failure HERE, before the build started, is reported: once it has
+      # started, the stack's events function reports the build's outcome.
+      # A CANCELLED run is not a verdict and reports nothing: it was replaced
+      # by a newer run of the same pull request (which reports for its own
+      # commit — the same one, when a label and a push raced on one head), so
+      # a `failed` here would only flash red and send the ticket back for
+      # nothing. A record a cancelled run leaves at `building` is Churner's
+      # stale-`building` deadline to settle. Never for a commit with no
+      # Dockerfile either: nothing was attempted there, so nothing failed.
+      - if: failure() && steps.app.outputs.present != 'false'
         uses: churner-ai/report-preview@v1
         with:
           token: ${{ secrets.preview-token }}
