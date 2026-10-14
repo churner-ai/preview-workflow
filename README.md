@@ -9,6 +9,25 @@ the deployer role the stack created, in your account, under your identity.
 
 ## Changelog
 
+- **v8** — the job no longer waits for its build. It uploads the commit,
+  reports `building`, starts the image build with the deploy request on it
+  (build environment variable `CHURNER_PREVIEW_REQUEST`) and ends in well
+  under a minute. When the build finishes, the stack's events function —
+  handed the build by the stack's build-finished rule — deploys it, probes
+  `<pr>.<preview-zone><health-path>` until it answers, and reports `ready`,
+  `queued` or `failed` (a failed build with its CodeBuild log) to Churner
+  itself, then deletes the pull request's superseded images. A build that
+  finishes after its pull request closed deploys nothing. The job's check no
+  longer turns red when the preview fails after its build started: Churner's
+  preview record carries that, and Churner gates a ticket that needs the
+  preview on that record. The teardown job now FAILS when the stack refuses
+  the teardown, and reports `destroyed` only once the stack removed the
+  preview or committed to removing it. A cancelled run (replaced by a newer
+  run of the same pull request) reports nothing — it is not a failure. The
+  settings fetch calls only a bare `https://` tracker origin. Same inputs as
+  v7. Needs a stack that reports
+  `PreviewBuildEventsRuleName`; Churner moves a repository onto `@v8` only
+  then.
 - **v7** — new optional input `runs-on` (JSON; default `"ubuntu-latest"`)
   picks the runner both jobs run on, so a repository whose GitHub-hosted
   runners are unavailable can run its previews on its own self-hosted
@@ -52,7 +71,7 @@ jobs:
     permissions:
       id-token: write     # mint the OIDC assertion for the deployer role
       contents: read      # check out the pull request's head commit
-    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v7
+    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v8
     with:
       project: ACME
       preview-zone: preview.example.com
@@ -93,7 +112,7 @@ stack's trust policy:
 | `build-context-bucket` | yes | — | The stack's `PreviewBuildContextBucket` output, `churner-preview-<projectKey>-src-<account>`. The pull request's source is uploaded here and built from it. New in v4. |
 | `secrets-prefix` | yes | — | Secrets Manager prefix the stack was configured with. |
 | `aws-region` | yes | — | Region the preview stack lives in. |
-| `health-path` | no | `/` | Rooted path the readiness gate polls. |
+| `health-path` | no | `/` | Rooted path the readiness gate (the stack's events function, from v8) polls. |
 | `ttl-hours` | no | `48` | Stamped onto the preview's service by the controller; the stack's sweep removes it once expired. Match the module's `PreviewTtlHours`. Left at `48`, the "Fetch preview settings" step (below) reads whatever the project's Previews settings card has saved and uses that instead; set this explicitly and it wins. |
 | `max-open-previews` | no | `''` | Match the module's `PreviewMaxOpenPreviews`. Reaches the controller on every run, so a changed limit takes effect on the very next push; a deploy past it is queued and starts by itself when a slot frees. Left empty, the "Fetch preview settings" step reads whatever is saved on the Previews settings card and uses that instead; set this explicitly and it wins. |
 | `runtime` | no | `fargate` | Where previews run. `fargate` is the only value; anything else fails the job before it builds. New in v6. |
@@ -179,14 +198,14 @@ Churner's Infrastructure page.
 |---|---|---|
 | `building` event | runner | — |
 | assume the deployer role | runner | `sts:AssumeRoleWithWebIdentity` (the role's trust policy) |
-| upload the head commit (`git archive`, no history) to `build-contexts/<repo>/<pr>/<sha>.tar.gz` | runner | `s3:PutObject` |
-| start the image build from that upload | runner | `codebuild:StartBuild` (source overridden to the upload) |
-| poll it, read the registry URI | runner | `codebuild:BatchGetBuilds` |
 | fetch preview settings | runner | `GET …/api/projects/:key/previews/settings`, same bearer as the events above — fail-soft |
-| register the task, create or update the service, route `<pr>.<preview-zone>` | controller function | `lambda:InvokeFunction` (the runner); everything else under the controller's own role |
+| upload the head commit (`git archive`, no history) to `build-contexts/<repo>/<pr>/<sha>.tar.gz` | runner | `s3:PutObject` |
+| start the image build from that upload, the deploy request on it | runner | `codebuild:StartBuild` (source overridden to the upload) — the job ends here |
+| build the image, reusing the project's cached layers | CodeBuild | the build role: push/pull on the stack's own registry |
+| hear the finished build, read it back | events function | the stack's build-finished rule; `codebuild:BatchGetBuilds` on the stack's project |
+| register the task, create or update the service, route `<pr>.<preview-zone>` | events function | the controller's own role |
 | inject the database URL and app secrets | **ECS** | the stack's task execution role |
-| readiness gate | runner | — |
-| `ready` / `queued` / `failed` event | runner | — |
+| readiness gate, `ready` / `queued` / `failed` event, superseded-image clean-up | events function | the stack's stored Churner preview token |
 | `destroyed` on close | runner | `lambda:InvokeFunction` |
 
 The database password and the application secrets never reach the runner.
