@@ -9,6 +9,17 @@ the deployer role the stack created, in your account, under your identity.
 
 ## Changelog
 
+- **v9** — a MERGED pull request's preview is kept instead of torn down:
+  the teardown job reads `merged` from the `pull_request.closed` event and,
+  when it is true, asks the stack's controller to `keep` the preview —
+  asleep at once, torn down by the stack's sweep at the merge plus the
+  project's "Keep a merged pull request's preview for" hours (fetched from
+  `…/previews/settings` as `keepMergedHours` and `maxKeptPreviews`; 0 hours
+  tears it down at the merge). A kept preview is not reported `destroyed`
+  by the job; the stack reports it when the sweep removes it. A pull request
+  closed without merging is torn down at once, as before, and a stack whose
+  controller does not know `keep` is torn down as before too. Same inputs as
+  v8.
 - **v8** — the job no longer waits for its build. It uploads the commit,
   reports `building`, starts the image build with the deploy request on it
   (build environment variable `CHURNER_PREVIEW_REQUEST`) and ends in well
@@ -71,7 +82,7 @@ jobs:
     permissions:
       id-token: write     # mint the OIDC assertion for the deployer role
       contents: read      # check out the pull request's head commit
-    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v8
+    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v9
     with:
       project: ACME
       preview-zone: preview.example.com

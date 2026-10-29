@@ -641,8 +641,9 @@ jobs:
           tracker-url: ${{ inputs.tracker-url }}
           build-log-url: ${{ steps.build.outputs.log-url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
 
-  # Its own job so it runs whether the pull request merged or was abandoned.
-  # The TTL reaper would get there eventually; "eventually" is up to
+  # Its own job so it runs whether the pull request merged or was abandoned
+  # (a merged one's preview is kept until its deadline, then the stack's
+  # sweep removes it). The TTL reaper would get there eventually; "eventually" is up to
   # `ttl-hours` of a database and a port held by a branch that no longer
   # exists.
   teardown:
@@ -679,18 +680,29 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
           role-session-name: churner-preview-teardown-${{ github.event.pull_request.number }}
 
-      # The controller writes the pull request's tombstone before anything
-      # else, so from its first step the teardown is committed: no build
-      # still running may put the preview back, and the stack's sweep
+      # A MERGED pull request's preview is KEPT, asleep, for the project's
+      # keep hours (`keepMergedHours` in the saved settings; 0 = torn down
+      # now), and the stack's sweep tears it down at that deadline and
+      # reports `destroyed` itself. Anything else — closed without merging,
+      # a keep of 0 hours, a stack whose controller predates `keep` — is the
+      # teardown: the controller writes the pull request's tombstone before
+      # anything else, so from its first step the teardown is committed: no
+      # build still running may put the preview back, and the stack's sweep
       # finishes any teardown this call could not. A refusal fails the job —
       # never a warning — and `destroyed` is reported only once the stack
       # has removed the preview or committed to removing it (`tombstoned`);
-      # the sweep reports `destroyed` itself when it finishes one.
+      # the sweep reports `destroyed` itself when it finishes one. The keep
+      # settings are fetched like the deploy's (fail-soft: without them the
+      # stack's own values apply).
       - name: Tear the Fargate preview down
         id: teardown
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGED: ${{ github.event.pull_request.merged }}
           CONTROLLER_FUNCTION: ${{ inputs.controller-function }}
+          TRACKER_URL: ${{ inputs.tracker-url }}
+          PROJECT: ${{ inputs.project }}
+          PREVIEW_TOKEN: ${{ secrets.preview-token }}
         run: |
           set -euo pipefail
           case "$PR_NUMBER" in
@@ -699,19 +711,57 @@ jobs:
           case "$CONTROLLER_FUNCTION" in
             ""|*[!A-Za-z0-9_-]*) echo "::error::controller-function must be the stack's controller function name"; exit 1 ;;
           esac
-          jq -n --arg pr "$PR_NUMBER" '{action: "destroy", pr: $pr}' > "${RUNNER_TEMP}/destroy.json"
-          aws lambda invoke \
-            --function-name "$CONTROLLER_FUNCTION" \
-            --cli-binary-format raw-in-base64-out \
-            --cli-read-timeout 330 \
-            --payload "file://${RUNNER_TEMP}/destroy.json" \
-            "${RUNNER_TEMP}/destroy-out.json" >/dev/null
-          if [ "$(jq -r '.ok // false' "${RUNNER_TEMP}/destroy-out.json")" = "true" ]; then
+          invoke() {
+            aws lambda invoke \
+              --function-name "$CONTROLLER_FUNCTION" \
+              --cli-binary-format raw-in-base64-out \
+              --cli-read-timeout 330 \
+              --payload "file://${RUNNER_TEMP}/teardown.json" \
+              "${RUNNER_TEMP}/teardown-out.json" >/dev/null
+          }
+          if [ "${MERGED:-}" = "true" ]; then
+            TRACKER_URL="${TRACKER_URL:-}"
+            PROJECT="${PROJECT:-}"
+            keep_hours=""
+            max_kept=""
+            if ! [[ "$TRACKER_URL" =~ ^https://[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]; then TRACKER_URL=""; fi
+            case "$PROJECT" in ""|*[!A-Za-z0-9_-]*) TRACKER_URL="" ;; esac
+            if [ -n "$TRACKER_URL" ]; then
+              # The token reaches curl through a config file on stdin, never argv.
+              body="$(
+                printf 'header = "Authorization: Bearer %s"\n' "${PREVIEW_TOKEN:-}" \
+                  | curl -fsS --max-time 10 --proto '=https' --max-redirs 0 -K - \
+                      "${TRACKER_URL}/api/projects/${PROJECT}/previews/settings" 2>/dev/null
+              )" || body=""
+              keep_hours="$(printf '%s' "$body" | jq -r '.keepMergedHours // empty' 2>/dev/null)" || keep_hours=""
+              max_kept="$(printf '%s' "$body" | jq -r '.maxKeptPreviews // empty' 2>/dev/null)" || max_kept=""
+            fi
+            case "$keep_hours" in *[!0-9]*) keep_hours="" ;; esac
+            case "$max_kept" in *[!0-9]*) max_kept="" ;; esac
+            jq -n --arg pr "$PR_NUMBER" --arg hours "$keep_hours" --arg cap "$max_kept" \
+              '{action: "keep", pr: $pr, keepHours: $hours, maxKeptPreviews: $cap}' > "${RUNNER_TEMP}/teardown.json"
+            invoke
+            if [ "$(jq -r '.kept // false' "${RUNNER_TEMP}/teardown-out.json")" = "true" ]; then
+              echo "Kept the merged pull request's preview asleep until $(jq -r '.keepUntil // "its deadline"' "${RUNNER_TEMP}/teardown-out.json"); the stack tears it down then."
+              exit 0
+            fi
+            # A stack whose controller predates `keep` refuses the action:
+            # tear the preview down as before rather than leave it running.
+            if jq -r '.error // ""' "${RUNNER_TEMP}/teardown-out.json" | grep -q "^unknown action 'keep'"; then
+              echo "This preview stack cannot keep a merged pull request's preview yet; tearing it down."
+              jq -n --arg pr "$PR_NUMBER" '{action: "destroy", pr: $pr}' > "${RUNNER_TEMP}/teardown.json"
+              invoke
+            fi
+          else
+            jq -n --arg pr "$PR_NUMBER" '{action: "destroy", pr: $pr}' > "${RUNNER_TEMP}/teardown.json"
+            invoke
+          fi
+          if [ "$(jq -r '.ok // false' "${RUNNER_TEMP}/teardown-out.json")" = "true" ]; then
             echo 'committed=true' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          reason="$(jq -r '.error // "the controller returned no answer"' "${RUNNER_TEMP}/destroy-out.json")"
-          if [ "$(jq -r '.tombstoned // false' "${RUNNER_TEMP}/destroy-out.json")" = "true" ]; then
+          reason="$(jq -r '.error // "the controller returned no answer"' "${RUNNER_TEMP}/teardown-out.json")"
+          if [ "$(jq -r '.tombstoned // false' "${RUNNER_TEMP}/teardown-out.json")" = "true" ]; then
             echo 'committed=true' >> "$GITHUB_OUTPUT"
           fi
           echo "::error::teardown refused: ${reason}"

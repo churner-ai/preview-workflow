@@ -1,12 +1,9 @@
 # This repository is published, not authored
 
-`.github/workflows/preview.yml` and `README.md` are copied from
-`github-actions/preview-workflow/` in the churner monorepo, which is where
-they are edited, reviewed and tested. Do not patch them here: the next
-release overwrites the file, and the change would never have run against the
-workflow's test suite (`shared/tests/preview-workflow.test.ts`).
+These files are copied from the churner monorepo, where they are edited, reviewed and tested.
+Do not patch them here: the next release overwrites them.
 
-From v6 previews run on Fargate only, through the preview stack's controller
-function; the workflow fetches no script from anywhere.
+- `.github/workflows/preview.yml` from `github-actions/preview-workflow/workflow.yml`
+- `README.md` from `github-actions/preview-workflow/README.md`
 
-Released from churner monorepo commit `ffa53c8d0`.
+Published as `v9` by Churner's production server from monorepo commit `5bbd3448be06`.
