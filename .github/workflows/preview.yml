@@ -104,7 +104,7 @@ on:
         description: >-
           How long the preview is expected to live. Mirrors the module's
           `PreviewTtlHours`; the controller stamps it onto the preview's
-          service and the stack's sweep enforces it. At the
+          service and the preview's expiry deadline enforces it. At the
           value 48, the "Fetch preview settings" step fetches whatever the
           project's Previews settings card has saved and uses THAT instead —
           the same live channel `max-open-previews` already has. Set this to
@@ -239,7 +239,7 @@ jobs:
       # `destroyed` ONLY when there was a container to remove; a pull request
       # that never had a preview posts nothing. Entirely fail-soft: a
       # repository with no app yet must never get a red check from here, and
-      # the TTL reaper is the backstop for anything this could not reach.
+      # the preview's expiry deadline is the backstop for anything this could not reach.
       - if: steps.app.outputs.present == 'false'
         id: credentials-retire
         continue-on-error: true
@@ -260,7 +260,7 @@ jobs:
         run: |
           set -uo pipefail
 
-          skip() { echo "::warning::could not check for an earlier preview of this pull request ($1); the stack's sweep removes any left behind"; exit 0; }
+          skip() { echo "::warning::could not check for an earlier preview of this pull request ($1); the preview's expiry deadline removes any left behind"; exit 0; }
 
           case "$PR_NUMBER" in
             ""|*[!0-9]*) skip "unusable pull-request number" ;;
@@ -642,8 +642,8 @@ jobs:
           build-log-url: ${{ steps.build.outputs.log-url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
 
   # Its own job so it runs whether the pull request merged or was abandoned
-  # (a merged one's preview is kept until its deadline, then the stack's
-  # sweep removes it). The TTL reaper would get there eventually; "eventually" is up to
+  # (a merged one's preview is kept until its deadline, then that deadline
+  # removes it). Its expiry deadline would get there eventually; "eventually" is up to
   # `ttl-hours` of a database and a port held by a branch that no longer
   # exists.
   teardown:
@@ -682,16 +682,16 @@ jobs:
 
       # A MERGED pull request's preview is KEPT, asleep, for the project's
       # keep hours (`keepMergedHours` in the saved settings; 0 = torn down
-      # now), and the stack's sweep tears it down at that deadline and
+      # now), and the preview's deadline tears it down at that time and
       # reports `destroyed` itself. Anything else — closed without merging,
       # a keep of 0 hours, a stack whose controller predates `keep` — is the
       # teardown: the controller writes the pull request's tombstone before
       # anything else, so from its first step the teardown is committed: no
-      # build still running may put the preview back, and the stack's sweep
-      # finishes any teardown this call could not. A refusal fails the job —
+      # build still running may put the preview back, and the preview's
+      # deadline finishes any teardown this call could not. A refusal fails the job —
       # never a warning — and `destroyed` is reported only once the stack
       # has removed the preview or committed to removing it (`tombstoned`);
-      # the sweep reports `destroyed` itself when it finishes one. The keep
+      # the deadline reports `destroyed` itself when it finishes one. The keep
       # settings are fetched like the deploy's (fail-soft: without them the
       # stack's own values apply).
       - name: Tear the Fargate preview down

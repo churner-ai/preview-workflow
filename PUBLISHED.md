@@ -6,4 +6,4 @@ Do not patch them here: the next release overwrites them.
 - `.github/workflows/preview.yml` from `github-actions/preview-workflow/workflow.yml`
 - `README.md` from `github-actions/preview-workflow/README.md`
 
-Published as `v9` by Churner's production server from monorepo commit `5bbd3448be06`.
+Published as `v10` by Churner's production server from monorepo commit `8300a1aa40cd`.

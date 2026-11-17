@@ -9,14 +9,17 @@ the deployer role the stack created, in your account, under your identity.
 
 ## Changelog
 
+- **v10** — the workflow's comments and warnings name the preview's own
+  expiry deadline, not the stack's sweep, as what tears a preview down and
+  removes one left behind. Same inputs and steps as v9.
 - **v9** — a MERGED pull request's preview is kept instead of torn down:
   the teardown job reads `merged` from the `pull_request.closed` event and,
   when it is true, asks the stack's controller to `keep` the preview —
-  asleep at once, torn down by the stack's sweep at the merge plus the
+  asleep at once, torn down by its own deadline at the merge plus the
   project's "Keep a merged pull request's preview for" hours (fetched from
   `…/previews/settings` as `keepMergedHours` and `maxKeptPreviews`; 0 hours
   tears it down at the merge). A kept preview is not reported `destroyed`
-  by the job; the stack reports it when the sweep removes it. A pull request
+  by the job; the stack reports it when its deadline removes it. A pull request
   closed without merging is torn down at once, as before, and a stack whose
   controller does not know `keep` is torn down as before too. Same inputs as
   v8.
@@ -82,7 +85,7 @@ jobs:
     permissions:
       id-token: write     # mint the OIDC assertion for the deployer role
       contents: read      # check out the pull request's head commit
-    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v9
+    uses: churner-ai/preview-workflow/.github/workflows/preview.yml@v10
     with:
       project: ACME
       preview-zone: preview.example.com
@@ -124,7 +127,7 @@ stack's trust policy:
 | `secrets-prefix` | yes | — | Secrets Manager prefix the stack was configured with. |
 | `aws-region` | yes | — | Region the preview stack lives in. |
 | `health-path` | no | `/` | Rooted path the readiness gate (the stack's events function, from v8) polls. |
-| `ttl-hours` | no | `48` | Stamped onto the preview's service by the controller; the stack's sweep removes it once expired. Match the module's `PreviewTtlHours`. Left at `48`, the "Fetch preview settings" step (below) reads whatever the project's Previews settings card has saved and uses that instead; set this explicitly and it wins. |
+| `ttl-hours` | no | `48` | Stamped onto the preview's service by the controller; the preview's own expiry deadline removes it once expired. Match the module's `PreviewTtlHours`. Left at `48`, the "Fetch preview settings" step (below) reads whatever the project's Previews settings card has saved and uses that instead; set this explicitly and it wins. |
 | `max-open-previews` | no | `''` | Match the module's `PreviewMaxOpenPreviews`. Reaches the controller on every run, so a changed limit takes effect on the very next push; a deploy past it is queued and starts by itself when a slot frees. Left empty, the "Fetch preview settings" step reads whatever is saved on the Previews settings card and uses that instead; set this explicitly and it wins. |
 | `runtime` | no | `fargate` | Where previews run. `fargate` is the only value; anything else fails the job before it builds. New in v6. |
 | `controller-function` | yes | — | The stack's `PreviewControllerFunctionName` output. The deployer role may invoke this function and nothing else. New in v6. |
